@@ -1,0 +1,146 @@
+```yaml
+volumes:
+  pg_data:
+
+networks:
+  router_net:
+
+services:
+  pg:
+    image: postgres:15
+
+    restart: unless-stopped
+
+    environment:
+      POSTGRES_USER: db_user
+      POSTGRES_PASSWORD: db_pass
+      POSTGRES_DB: hyperswitch_db
+
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+
+    networks:
+      - router_net
+
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -d hyperswitch_db -U db_user"]
+      interval: 5s
+      retries: 5
+      timeout: 5s
+
+  redis-standalone:
+    image: redis:7-alpine
+
+    restart: unless-stopped
+
+    command: redis-server --appendonly yes
+
+    networks:
+      - router_net
+
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli ping | grep PONG"]
+      interval: 5s
+      retries: 5
+
+  migration_runner:
+    image: docker.io/debian:trixie-slim
+
+    command: >
+      bash -c "
+      apt-get update &&
+      apt-get install -y curl xz-utils &&
+      curl --proto '=https' --tlsv1.2 -LsSf https://github.com/diesel-rs/diesel/releases/download/v2.3.5/diesel_cli-installer.sh | bash &&
+      if ! command -v just >/dev/null 2>&1; then
+        curl --proto '=https' --tlsv1.2 -sSf https://just.systems/install.sh | bash -s -- --to /usr/local/bin;
+      fi &&
+      export PATH=$PATH:$HOME/.cargo/bin &&
+      just migrate
+      "
+
+    working_dir: /app
+
+    volumes:
+      - ./:/app
+
+    environment:
+      - DATABASE_URL=postgresql://db_user:db_pass@pg:5432/hyperswitch_db
+
+    depends_on:
+      pg:
+        condition: service_healthy
+
+    networks:
+      - router_net
+
+  superposition:
+    image: ghcr.io/juspay/superposition-demo:0.102.0
+
+    restart: unless-stopped
+
+    environment:
+      - API_HOSTNAME=http://localhost:8081
+      - REDIS_URL=redis://redis-standalone:6379
+
+    ports:
+      - "8081:8080"
+
+    depends_on:
+      redis-standalone:
+        condition: service_healthy
+
+    networks:
+      - router_net
+
+  superposition-init:
+    image: alpine:latest
+
+    restart: "no"
+
+    command: >
+      sh -c "
+      apk add --no-cache curl jq yq &&
+      echo 'superposition initialized'
+      "
+
+    depends_on:
+      superposition:
+        condition: service_started
+
+    networks:
+      - router_net
+
+  hyperswitch-server:
+    image: docker.juspay.io/juspaydotin/hyperswitch-router:standalone
+
+    restart: unless-stopped
+
+    command: /local/bin/router -f /local/config/docker_compose.toml
+
+    ports:
+      - "8085:8080"
+
+    volumes:
+      - ./config:/local/config
+
+    depends_on:
+      pg:
+        condition: service_healthy
+
+      redis-standalone:
+        condition: service_healthy
+
+      migration_runner:
+        condition: service_completed_successfully
+
+      superposition-init:
+        condition: service_completed_successfully
+
+    networks:
+      - router_net
+
+    healthcheck:
+      test: ["CMD-SHELL", "wget --spider -q http://localhost:8080/health || exit 1"]
+      interval: 10s
+      retries: 10
+```
