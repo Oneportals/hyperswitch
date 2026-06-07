@@ -1,4 +1,3 @@
-```yaml
 volumes:
   pg_data:
 
@@ -143,4 +142,3 @@ services:
       test: ["CMD-SHELL", "wget --spider -q http://localhost:8080/health || exit 1"]
       interval: 10s
       retries: 10
-```
