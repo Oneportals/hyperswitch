@@ -89,3 +89,17 @@ services:
       interval: 15s
       timeout: 5s
       retries: 10
+    environment:
+      RUN_ENV: development
+
+      ROUTER__MASTER_DATABASE__USERNAME: db_user
+      ROUTER__MASTER_DATABASE__PASSWORD: db_pass
+      ROUTER__MASTER_DATABASE__HOST: pg
+      ROUTER__MASTER_DATABASE__PORT: 5432
+      ROUTER__MASTER_DATABASE__DBNAME: hyperswitch_db
+
+      ROUTER__REPLICA_DATABASE__USERNAME: db_user
+      ROUTER__REPLICA_DATABASE__PASSWORD: db_pass
+      ROUTER__REPLICA_DATABASE__HOST: pg
+      ROUTER__REPLICA_DATABASE__PORT: 5432
+      ROUTER__REPLICA_DATABASE__DBNAME: hyperswitch_db
