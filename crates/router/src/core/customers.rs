@@ -11,6 +11,7 @@ use common_utils::{
         keymanager::{Identifier, KeyManagerState, ToEncryptable},
         Description,
     },
+    validation::validate_phone_country_code,
 };
 use error_stack::{report, ResultExt};
 use hyperswitch_domain_models::{
@@ -47,6 +48,26 @@ use crate::{
 
 pub const REDACTED: &str = "Redacted";
 
+pub fn is_global_customer_id_format(input: &str) -> bool {
+    let mut parts = input.split('_');
+    match (parts.next(), parts.next(), parts.next(), parts.next()) {
+        (Some(cell_id), Some(entity), Some(uuid), None) => {
+            !cell_id.is_empty()
+                && cell_id
+                    .chars()
+                    .all(|character| character.is_ascii_lowercase() || character.is_ascii_digit())
+                && entity == "cus"
+                && uuid.len() == 32
+                && uuid::Uuid::parse_str(uuid).is_ok()
+        }
+        _ => false,
+    }
+}
+
+pub fn is_customer_id_in_global_format(customer_id: &id_type::CustomerId) -> bool {
+    is_global_customer_id_format(customer_id.get_string_repr())
+}
+
 #[instrument(skip(state))]
 pub async fn create_customer(
     state: SessionState,
@@ -59,6 +80,15 @@ pub async fn create_customer(
         .document_details
         .as_ref()
         .map(|doc_details| doc_details.validate())
+        .transpose()
+        .map_err(|err| errors::CustomersErrorResponse::InvalidRequestData {
+            message: err.to_string(),
+        })?;
+
+    customer_data
+        .phone_country_code
+        .as_deref()
+        .map(validate_phone_country_code)
         .transpose()
         .map_err(|err| errors::CustomersErrorResponse::InvalidRequestData {
             message: err.to_string(),
@@ -235,35 +265,31 @@ impl CustomerCreateBridge for customers::CustomerRequest {
             pii::SecretSerdeValue::new(serde_json::Value::Object(map))
         });
 
-        Ok(domain::Customer {
-            customer_id: merchant_reference_id
+        Ok(domain::Customer::new(
+            merchant_reference_id
                 .to_owned()
                 .ok_or(errors::CustomersErrorResponse::InternalServerError)?,
-            merchant_id: merchant_id.to_owned(),
-            name: encryptable_customer.name,
-            email: encryptable_customer.email.map(|email| {
+            merchant_id.to_owned(),
+            encryptable_customer.name,
+            encryptable_customer.email.map(|email| {
                 let encryptable: Encryptable<Secret<String, pii::EmailStrategy>> = Encryptable::new(
                     email.clone().into_inner().switch_strategy(),
                     email.into_encrypted(),
                 );
                 encryptable
             }),
-            phone: encryptable_customer.phone,
-            description: self.description.clone(),
-            phone_country_code: self.phone_country_code.clone(),
-            metadata: self.metadata.clone(),
+            encryptable_customer.phone,
+            self.phone_country_code.clone(),
+            self.description.clone(),
+            self.metadata.clone(),
             connector_customer,
-            address_id: address_from_db.clone().map(|addr| addr.address_id),
-            created_at: common_utils::date_time::now(),
-            modified_at: common_utils::date_time::now(),
-            default_payment_method_id: None,
-            updated_by: None,
-            version: common_types::consts::API_VERSION,
-            tax_registration_id: encryptable_customer.tax_registration_id,
-            document_details: document_details_encrypted,
-            created_by: initiator.and_then(|initiator| initiator.to_created_by()),
-            last_modified_by: initiator.and_then(|initiator| initiator.to_created_by()),
-        })
+            address_from_db.clone().map(|addr| addr.address_id),
+            encryptable_customer.tax_registration_id,
+            document_details_encrypted,
+            initiator.and_then(|initiator| initiator.to_created_by()),
+            initiator.and_then(|initiator| initiator.to_created_by()),
+            id_type::GlobalCustomerId::generate(&state.conf.cell_information.id),
+        ))
     }
 
     fn generate_response<'a>(
@@ -614,6 +640,32 @@ pub async fn retrieve_customer(
     ))
 }
 
+#[cfg(feature = "v2")]
+#[instrument(skip(state))]
+pub async fn retrieve_customer_by_merchant_reference_id(
+    state: SessionState,
+    provider: domain::Provider,
+    merchant_reference_id: id_type::CustomerId,
+) -> errors::CustomerResponse<customers::CustomerResponse> {
+    let db = state.store.as_ref();
+
+    let response = db
+        .find_customer_by_merchant_reference_id_merchant_id(
+            &merchant_reference_id,
+            provider.get_account().get_id(),
+            provider.get_key_store(),
+            provider.get_account().storage_scheme,
+        )
+        .await
+        .switch()?;
+
+    Ok(services::ApplicationResponse::Json(
+        customers::CustomerResponse::try_from(response)
+            .change_context(errors::CustomersErrorResponse::InternalServerError)
+            .attach_printable("Failed to convert domain customer to CustomerResponse")?,
+    ))
+}
+
 #[instrument(skip(state))]
 pub async fn list_customers(
     state: SessionState,
@@ -771,9 +823,11 @@ impl CustomerDeleteBridge for id_type::GlobalCustomerId {
         {
             Ok(customer_payment_methods) => {
                 for pm in customer_payment_methods.into_iter() {
-                    delete_payment_method_by_record(db, state, platform, &profile, pm)
-                        .await
-                        .switch()?;
+                    Box::pin(delete_payment_method_by_record(
+                        db, state, platform, &profile, pm,
+                    ))
+                    .await
+                    .switch()?;
                 }
             }
             Err(error) => {
@@ -1119,6 +1173,16 @@ pub async fn update_customer(
             message: err.to_string(),
         })?;
 
+    update_customer
+        .request
+        .phone_country_code
+        .as_deref()
+        .map(validate_phone_country_code)
+        .transpose()
+        .map_err(|err| errors::CustomersErrorResponse::InvalidRequestData {
+            message: err.to_string(),
+        })?;
+
     let db = state.store.as_ref();
     let key_manager_state = &(&state).into();
     //Add this in update call if customer can be updated anywhere else
@@ -1218,7 +1282,7 @@ impl AddressStructForDbUpdate<'_> {
                             .attach_printable(format!(
                             "Failed while updating address: merchant_id: {:?}, customer_id: {:?}",
                             self.merchant_account.get_id(),
-                            self.domain_customer.customer_id
+                            self.domain_customer.get_id()
                         ))?,
                     )
                 }
@@ -1231,7 +1295,7 @@ impl AddressStructForDbUpdate<'_> {
                             self.state,
                             customer_address,
                             self.merchant_account.get_id(),
-                            &self.domain_customer.customer_id,
+                            self.domain_customer.get_id(),
                             self.key_store.key.get_inner().peek(),
                             self.merchant_account.storage_scheme,
                         )
@@ -1402,7 +1466,7 @@ impl CustomerUpdateBridge for customers::CustomerUpdateRequest {
 
         let response = db
             .update_customer_by_customer_id_merchant_id(
-                domain_customer.customer_id.to_owned(),
+                domain_customer.get_id().to_owned(),
                 provider.get_account().get_id().to_owned(),
                 domain_customer.to_owned(),
                 storage::CustomerUpdate::Update {
@@ -1700,4 +1764,32 @@ async fn sync_connector_customer_for_migrated_customer(
     .switch()?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_customer_id_in_global_format() {
+        let test_cases = [
+            ("0asbjabjbd", false),
+            ("0a_cus_12345678123456781234567812345678", true),
+            ("abc12_cus_12345678123456781234567812345678", true),
+            ("1b_cus_12iufbeksjeb", false),
+            ("efbc2_cus_217846821", false),
+            ("0a_pm_12345678123456781234567812345678", false),
+        ];
+
+        for (customer_id_str, expected) in test_cases {
+            let customer_id =
+                id_type::CustomerId::wrap(customer_id_str.to_string()).expect("valid customer id");
+
+            assert_eq!(
+                is_customer_id_in_global_format(&customer_id),
+                expected,
+                "failed for customer_id={customer_id_str}",
+            );
+        }
+    }
 }

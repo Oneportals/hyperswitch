@@ -36,13 +36,14 @@ pub enum ApiIdentifier {
     User,
     UserRole,
     ConnectorOnboarding,
-    AiWorkflow,
     Poll,
     ApplePayCertificatesMigration,
     Relay,
     Documentation,
     CardNetworkTokenization,
     Hypersense,
+    ExternalServiceAuth,
+    OfferEngine,
     PaymentMethodSession,
     ProcessTracker,
     Authentication,
@@ -53,6 +54,7 @@ pub enum ApiIdentifier {
     RecoveryRecovery,
     Superposition,
     CardIssuers,
+    HierarchicalResources,
 }
 
 impl From<Flow> for ApiIdentifier {
@@ -69,10 +71,15 @@ impl From<Flow> for ApiIdentifier {
             | Flow::OrganizationRetrieve
             | Flow::OrganizationUpdate
             | Flow::ConvertOrganizationToPlatform => Self::Organization,
+            Flow::HierarchicalResourcesGenerate
+            | Flow::HierarchicalResourcesUpload
+            | Flow::HierarchicalResourcesList
+            | Flow::HierarchicalResourcesLink => Self::HierarchicalResources,
             Flow::RoutingCreateConfig
             | Flow::RoutingLinkConfig
             | Flow::RoutingUnlinkConfig
             | Flow::RoutingRetrieveConfig
+            | Flow::DecisionEngineSsoRedirect
             | Flow::RoutingRetrieveActiveConfig
             | Flow::RoutingRetrieveDefaultConfig
             | Flow::RoutingRetrieveDictionary
@@ -86,7 +93,9 @@ impl From<Flow> for ApiIdentifier {
             | Flow::UpdateDynamicRoutingConfigs
             | Flow::DecisionManagerUpsertConfig
             | Flow::RoutingEvaluateRule
+            | Flow::DecisionEngineDiffCounterReset
             | Flow::DecisionEngineRuleMigration
+            | Flow::DecisionEngineMigrationStatus
             | Flow::VolumeSplitOnRoutingType
             | Flow::DecisionEngineDecideGatewayCall
             | Flow::DecisionEngineGatewayFeedbackCall => Self::Routing,
@@ -108,6 +117,9 @@ impl From<Flow> for ApiIdentifier {
             Flow::BatchBlocklistUpload => Self::Blocklist,
             Flow::GetBatchBlocklistJobStatus => Self::Blocklist,
             Flow::ListBatchBlocklistJobs => Self::Blocklist,
+            Flow::GetBlocklistCount => Self::Blocklist,
+            Flow::LookupBlocklistEntry => Self::Blocklist,
+            Flow::CreateBlocklistExport => Self::Blocklist,
             Flow::MerchantConnectorsCreate
             | Flow::MerchantConnectorsRetrieve
             | Flow::MerchantConnectorsUpdate
@@ -117,19 +129,26 @@ impl From<Flow> for ApiIdentifier {
             | Flow::ConfigKeyFetch
             | Flow::ConfigKeyUpdate
             | Flow::ConfigKeyDelete
-            | Flow::CreateConfigKey => Self::Configs,
+            | Flow::CreateConfigKey
+            | Flow::UnifiedConnectorServiceKillSwitchStatus
+            | Flow::UnifiedConnectorServiceKillSwitchReset => Self::Configs,
             Flow::CustomersCreate
             | Flow::CustomersRetrieve
+            | Flow::CustomersRetrieveByReferenceId
             | Flow::CustomersUpdate
             | Flow::CustomersDelete
             | Flow::CustomersGetMandates
+            | Flow::CustomersGlobalIdMigration
             | Flow::CustomersList
             | Flow::CustomersListWithConstraints => Self::Customers,
             Flow::EphemeralKeyCreate | Flow::EphemeralKeyDelete => Self::Ephemeral,
             Flow::DeepHealthCheck | Flow::HealthCheck => Self::Health,
+            Flow::OfferEngineConnectivityCheck => Self::Health,
+            Flow::OfferEngineBrowseOffers => Self::OfferEngine,
             Flow::MandatesRetrieve | Flow::MandatesRevoke | Flow::MandatesList => Self::Mandates,
             Flow::PaymentMethodsCreate
             | Flow::PaymentMethodsMigrate
+            | Flow::ModularPaymentMethodsMigrate
             | Flow::PaymentMethodsBatchUpdate
             | Flow::PaymentMethodsBatchRetrieve
             | Flow::PaymentMethodsList
@@ -187,7 +206,11 @@ impl From<Flow> for ApiIdentifier {
             | Flow::PaymentsRetrieveUsingMerchantReferenceId
             | Flow::PaymentAttemptsList
             | Flow::RecoveryPaymentsCreate
-            | Flow::PaymentsSubmitEligibility => Self::Payments,
+            | Flow::PaymentsSubmitCheckEligibility
+            | Flow::PaymentsSubmitEligibility
+            // PaymentLinkCreate creates a payment intent, so it uses the Payments lock namespace
+            | Flow::PaymentLinkCreate
+            | Flow::PaymentsCancelPostCaptureSync => Self::Payments,
             Flow::PayoutsCreate
             | Flow::PayoutsRetrieve
             | Flow::PayoutsUpdate
@@ -204,6 +227,7 @@ impl From<Flow> for ApiIdentifier {
             | Flow::RefundsRetrieve
             | Flow::RefundsRetrieveForceSync
             | Flow::RefundsUpdate
+            | Flow::RefundsReverse
             | Flow::RefundsList
             | Flow::RefundsFilters
             | Flow::RefundsAggregate
@@ -328,9 +352,8 @@ impl From<Flow> for ApiIdentifier {
             | Flow::GetEmbeddedToken
             | Flow::GetUserDetailsInternal
             | Flow::ListUsersInternal
-            | Flow::ListMembersForEntity => Self::User,
-
-            Flow::GetDataFromHyperswitchAiFlow | Flow::ListAllChatInteractions => Self::AiWorkflow,
+            | Flow::ListMembersForEntity
+            | Flow::LaunchSage => Self::User,
 
             Flow::ListRolesV2
             | Flow::ListInvitableRolesAtEntityLevel
@@ -364,6 +387,7 @@ impl From<Flow> for ApiIdentifier {
             Flow::HypersenseTokenRequest
             | Flow::HypersenseVerifyToken
             | Flow::HypersenseSignoutToken => Self::Hypersense,
+            Flow::ExternalServiceValidateToken => Self::ExternalServiceAuth,
             Flow::PaymentMethodSessionCreate
             | Flow::PaymentMethodSessionRetrieve
             | Flow::PaymentMethodSessionConfirm
@@ -387,9 +411,22 @@ impl From<Flow> for ApiIdentifier {
             | Flow::TokenizationDelete
             | Flow::NetworkTokenEligibilityCheck => Self::GenericTokenization,
 
-            Flow::RecoveryDataBackfill | Flow::RevenueRecoveryRedis => Self::RecoveryRecovery,
-            Flow::GetSuperpositionSdkConfig => Self::Superposition,
-            Flow::MerchantConnectorWebhookRegister | Flow::MerchantConnectorWebhookList => {
+            Flow::RecoveryDataBackfill
+            | Flow::RecoveryRetryStatsMigration
+            | Flow::RevenueRecoveryRedis => Self::RecoveryRecovery,
+            Flow::GetSuperpositionSdkConfig
+            | Flow::SuperpositionListContexts
+            | Flow::SuperpositionListDefaultConfigs
+            | Flow::SuperpositionListDimensions
+            | Flow::SuperpositionGetDimension
+            | Flow::SuperpositionGetDefaultConfig
+            | Flow::SuperpositionCreateContext
+            | Flow::SuperpositionResolveDetailedConfig
+            | Flow::SuperpositionResolveConfigExplanation
+            | Flow::SuperpositionListAuditLogs => Self::Superposition,
+            Flow::MerchantConnectorWebhookRegister
+            | Flow::MerchantConnectorWebhookList
+            | Flow::MerchantConnectorWebhookGenerateSecret => {
                 Self::MerchantConnectorWebhookManagement
             }
             Flow::AddCardIssuer

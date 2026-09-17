@@ -43,9 +43,16 @@ fn get_group_description(group: PermissionGroup) -> Option<&'static str> {
         PermissionGroup::UsersManage => Some("Manage and invite Users to the Team"),
         PermissionGroup::AccountView => Some("View Merchant Details"),
         PermissionGroup::AccountManage => Some("Create, modify and delete Merchant Details like api keys, webhooks, etc"),
+        // Omits these from the authorization-info response; hidden until the role backfill
+        PermissionGroup::WebhooksView => None,
+        PermissionGroup::WebhooksManage => None,
+        PermissionGroup::ApiKeysView => None,
+        PermissionGroup::ApiKeysManage => None,
         PermissionGroup::ThemeView => Some("View Themes"),
         PermissionGroup::ThemeManage => Some("Manage Themes"),
-        PermissionGroup::InternalManage => None, // Internal group, no user-facing description
+        PermissionGroup::ConfigurationsView => Some("View Configurations"),
+        PermissionGroup::ConfigurationsManage => Some("Create, modify and delete Configurations"),
+        PermissionGroup::CloneConnectorManage => None, // Admin-only, no user-facing description
         PermissionGroup::ReconSourcesView => Some("View recon ingestion and transformation configs and files"),
         PermissionGroup::ReconSourcesManage => Some("Create and edit recon ingestion and transformation configs and download files"),
         PermissionGroup::ReconExceptionsView => Some("Investigate Exceptions and view resolutions"),
@@ -54,6 +61,8 @@ fn get_group_description(group: PermissionGroup) -> Option<&'static str> {
         PermissionGroup::ReconTransactionsManage => Some("View and edit recon staging entries and transactions"),
         PermissionGroup::ReconRulesView => Some("View reconciliation rules"),
         PermissionGroup::ReconRulesManage => Some("Create and edit reconciliation rules"),
+        PermissionGroup::OffersView => Some("View Offers"),
+        PermissionGroup::OffersManage => Some("Create, modify and delete Offers"),
     }
 }
 
@@ -65,11 +74,16 @@ pub fn get_parent_group_description(group: ParentGroup) -> Option<&'static str> 
         ParentGroup::Analytics => Some("View Analytics"),
         ParentGroup::Users =>  Some("Manage and invite Users to the Team"),
         ParentGroup::Account => Some("Create, modify and delete Merchant Details like api keys, webhooks, etc"),
+        // Omits these from the authorization-info response; hidden until the role backfill
+        ParentGroup::Webhook => None,
+        ParentGroup::ApiKeys => None,
         ParentGroup::Theme => Some("Manage and view themes for the organization"),
-        ParentGroup::Internal => None, // Internal group, no user-facing description
+        ParentGroup::Configurations => Some("Manage and view configurations"),
+        ParentGroup::CloneConnector => None, // Admin-only, no user-facing description
         ParentGroup::ReconSources => Some("Recon ingestion and transformation pipelines"),
         ParentGroup::ReconExceptions => Some("Recon exception investigation and resolution"),
         ParentGroup::ReconTransactions => Some("Recon staging entries and transactions"),
         ParentGroup::ReconRules => Some("Reconciliation rules"),
+        ParentGroup::Offers => Some("Manage and view offers"),
     }
 }

@@ -3,6 +3,7 @@ import {
   multiUseMandateData,
   singleUseMandateData,
 } from "./Commons";
+// import { getCustomExchange } from "./Modifiers";
 const mockBillingDetails = {
   address: {
     line1: "Servidao B-1",
@@ -39,6 +40,9 @@ const payment_method_data_no3ds = {
   card: {
     last4: "1111",
     card_type: "DEBIT",
+    card_subtype: "VISA CLASSIC",
+    card_segment_type: "consumer",
+    funding_source: "DEBIT",
     card_network: "Visa",
     card_issuer: "Conotoxia Sp Z Oo",
     card_issuing_country: "POLAND",
@@ -57,6 +61,9 @@ const payment_method_data_no3ds_address = {
   card: {
     last4: "1111",
     card_type: "DEBIT",
+    card_subtype: "VISA CLASSIC",
+    card_segment_type: "consumer",
+    funding_source: "DEBIT",
     card_network: "Visa",
     card_issuer: "Conotoxia Sp Z Oo",
     card_issuing_country: "POLAND",
@@ -75,6 +82,9 @@ const payment_method_data_3ds_address = {
   card: {
     last4: "1111",
     card_type: "DEBIT",
+    card_subtype: "VISA CLASSIC",
+    card_segment_type: "consumer",
+    funding_source: "DEBIT",
     card_network: "Visa",
     card_issuer: "Conotoxia Sp Z Oo",
     card_issuing_country: "POLAND",
@@ -90,6 +100,95 @@ const payment_method_data_3ds_address = {
   billing: mockBillingDetails,
 };
 export const connectorDetails = {
+  voucher_pm: {
+    PaymentIntent: () => {
+      return {
+        Request: {
+          currency: "MXN",
+        },
+        Response: {
+          status: 200,
+          body: {
+            status: "requires_payment_method",
+          },
+        },
+      };
+    },
+    Oxxo: {
+      Request: {
+        payment_method: "voucher",
+        payment_method_type: "oxxo",
+        payment_method_data: {
+          voucher: "oxxo",
+        },
+        billing: {
+          address: {
+            line1: "123 Test Street",
+            city: "Mexico City",
+            state: "CDMX",
+            zip: "01000",
+            country: "MX",
+            first_name: "Test",
+            last_name: "Customer",
+          },
+          email: "guest@example.com",
+        },
+        customer: {
+          document_details: {
+            document_type: "cnpj",
+            document_number: "12345678000195",
+          },
+        },
+        currency: "MXN",
+      },
+      Response: {
+        status: 200,
+        body: {
+          status: "requires_customer_action",
+          payment_method: "voucher",
+          payment_method_type: "oxxo",
+        },
+      },
+    },
+    OxxoInvalidFormat: {
+      Request: {
+        payment_method: "voucher",
+        payment_method_type: "oxxo",
+        payment_method_data: {
+          voucher: "invalid_oxxo_value",
+        },
+        billing: {
+          address: {
+            line1: "123 Test Street",
+            city: "Mexico City",
+            state: "CDMX",
+            zip: "01000",
+            country: "MX",
+            first_name: "Test",
+            last_name: "Customer",
+          },
+          email: "guest@example.com",
+        },
+        customer: {
+          document_details: {
+            document_type: "cnpj",
+            document_number: "12345678000195",
+          },
+        },
+        currency: "MXN",
+      },
+      Response: {
+        status: 400,
+        body: {
+          error: {
+            message:
+              "Json deserialize error: unknown variant `invalid_oxxo_value`, expected one of `boleto`, `efecty`, `pago_efectivo`, `red_compra`, `red_pagos`, `alfamart`, `indomaret`, `oxxo`, `seven_eleven`, `lawson`, `mini_stop`, `family_mart`, `seicomart`, `pay_easy`",
+            code: "IR_06",
+          },
+        },
+      },
+    },
+  },
   card_pm: {
     No3DSFailPayment: {
       Request: {
@@ -325,6 +424,7 @@ export const connectorDetails = {
     },
     MandateSingleUseNo3DSAutoCapture: {
       Request: {
+        amount: 6000,
         payment_method: "card",
         payment_method_data: {
           card: successfulCardDetails,
@@ -350,6 +450,7 @@ export const connectorDetails = {
     },
     MandateSingleUseNo3DSManualCapture: {
       Request: {
+        amount: 6000,
         payment_method: "card",
         payment_method_data: {
           card: successfulCardDetails,
@@ -368,6 +469,7 @@ export const connectorDetails = {
     },
     MITManualCapture: {
       Request: {
+        amount: 6000,
         payment_method_data: {
           card: successfulCardDetails,
           billing: mockBillingDetails,
@@ -446,6 +548,7 @@ export const connectorDetails = {
     },
     MandateMultiUseNo3DSAutoCapture: {
       Request: {
+        amount: 6000,
         payment_method: "card",
         payment_method_data: {
           card: successfulCardDetails,
@@ -468,6 +571,7 @@ export const connectorDetails = {
     },
     MandateMultiUseNo3DSManualCapture: {
       Request: {
+        amount: 6000,
         payment_method: "card",
         payment_method_data: {
           card: successfulCardDetails,
@@ -491,6 +595,7 @@ export const connectorDetails = {
     },
     ZeroAuthMandate: {
       Request: {
+        amount: 0,
         payment_method: "card",
         payment_method_data: {
           card: successfulCardDetails,
@@ -526,6 +631,7 @@ export const connectorDetails = {
     },
     ZeroAuthConfirmPayment: {
       Request: {
+        amount: 0,
         payment_type: "setup_mandate",
         payment_method: "card",
         payment_method_data: {

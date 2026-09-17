@@ -1,5 +1,19 @@
+#[cfg(feature = "v1")]
+use std::time::Instant;
+
+#[cfg(feature = "v1")]
+use common_utils::types::keymanager::KeyManagerState;
+
+#[cfg(feature = "v1")]
 use crate::{
-    core::api_locking::{self, GetLockingInput},
+    core::utils::get_feature_config,
+    routes::metrics::{record_payment_confirm, MerchantMode, PaymentMetricsContext},
+};
+use crate::{
+    core::{
+        api_locking::{self, GetLockingInput},
+        payments::operations::Operation,
+    },
     services::authorization::permissions::Permission,
 };
 pub mod helpers;
@@ -14,6 +28,8 @@ use router_env::{env, instrument, logger, tracing, types, Flow};
 use super::app::ReqState;
 #[cfg(feature = "v2")]
 use crate::core::payment_method_balance;
+#[cfg(feature = "v1")]
+use crate::core::payments::server_integration;
 #[cfg(feature = "v2")]
 use crate::core::revenue_recovery::api as recovery;
 #[cfg(feature = "v1")]
@@ -26,11 +42,12 @@ use crate::{
         payments::{self, transformers::ToResponse, OperationSessionGetters, PaymentRedirectFlow},
     },
     routes::lock_utils,
-    services::{api, authentication as auth},
+    services::{self, api, authentication as auth},
     types::{
         api::{
             self as api_types, enums as api_enums,
             payments::{self as payment_types, PaymentIdTypeExt},
+            ConnectorData, GetToken,
         },
         domain,
         transformers::{ForeignTryFrom, ForeignTryInto},
@@ -117,6 +134,161 @@ pub async fn payments_create(
         ),
     };
 
+    let integration_type = server_integration::integration_type_from_headers(req.headers());
+
+    // Merchant-only auth here, so the header alone opts in. A create-and-confirm has no use for
+    // the enrichment, and the session core rejects the statuses it lands in.
+    let is_create_and_confirm = payload.confirm.is_some_and(|confirm| confirm);
+    let enrich = integration_type.is_server() && !is_create_and_confirm;
+
+    Box::pin(api::server_wrap(
+        flow,
+        state,
+        &req,
+        payload,
+        move |mut state, auth: auth::AuthenticationData, req, req_state| {
+            let header_payload = header_payload.clone();
+            async move {
+                let merchant_integration_type =
+                    server_integration::merchant_integration_type(&state, &auth.platform).await;
+                server_integration::validate_integration_type(
+                    integration_type,
+                    merchant_integration_type,
+                )?;
+
+                let metrics_start = req
+                    .confirm
+                    .is_some_and(|confirm| confirm)
+                    .then(Instant::now);
+                let metrics_context = if metrics_start.is_some() {
+                    Some(set_payment_confirm_metrics_context(&mut state, &auth.platform).await)
+                } else {
+                    None
+                };
+
+                let profile_id = auth.profile.map(|profile| profile.get_id().clone());
+
+                // Only the enrichment path needs these afterwards. A client create — the vast
+                // majority — clones nothing.
+                let enrichment_inputs = enrich.then(|| {
+                    (
+                        state.clone(),
+                        req_state.clone(),
+                        auth.platform.clone(),
+                        profile_id.clone(),
+                        header_payload.clone(),
+                    )
+                });
+
+                let result = Box::pin(authorize_verify_select::<_>(
+                    payments::PaymentCreate,
+                    state,
+                    req_state,
+                    auth.platform,
+                    profile_id,
+                    header_payload,
+                    req,
+                    api::AuthFlow::Client,
+                ))
+                .await;
+
+                if let (Some(start), Some(context)) = (metrics_start, metrics_context) {
+                    record_payment_confirm(&result, start.elapsed(), context);
+                }
+
+                let response = result?;
+
+                // Invoked directly, not through `server_wrap`: both flows map to
+                // `ApiIdentifier::Payments`, so a nested wrap would deadlock on the lock this
+                // request already holds.
+                let enrich_payment = |mut payment: payment_types::PaymentsResponse| async {
+                    if let Some((state, req_state, platform, profile_id, header_payload)) =
+                        enrichment_inputs
+                    {
+                        let id = payment.payment_id.clone();
+                        Box::pin(server_integration::attach_server_context(
+                            state,
+                            req_state,
+                            platform,
+                            profile_id,
+                            &id,
+                            header_payload,
+                            &mut payment,
+                        ))
+                        .await;
+                    }
+                    payment
+                };
+
+                // `enrich_payment` is a no-op when `enrichment_inputs` is `None`, so the opt-in
+                // decision lives in exactly one place rather than being re-tested here.
+                match response {
+                    services::ApplicationResponse::JsonWithHeaders((payment, headers)) => {
+                        Ok(services::ApplicationResponse::JsonWithHeaders((
+                            enrich_payment(payment).await,
+                            headers,
+                        )))
+                    }
+                    services::ApplicationResponse::Json(payment) => Ok(
+                        services::ApplicationResponse::Json(enrich_payment(payment).await),
+                    ),
+                    response => Ok(response),
+                }
+            }
+        },
+        auth_type,
+        locking_action,
+    ))
+    .await
+}
+
+#[cfg(feature = "v1")]
+#[instrument(skip_all, fields(flow = ?Flow::PaymentLinkCreate, payment_id))]
+pub async fn payment_link_create(
+    state: web::Data<app::AppState>,
+    req: actix_web::HttpRequest,
+    json_payload: web::Json<payment_types::PaymentsRequest>,
+) -> impl Responder {
+    let flow = Flow::PaymentLinkCreate;
+    let mut payload = json_payload.into_inner().for_payment_link();
+
+    if let Err(err) = payload
+        .validate()
+        .map_err(|message| errors::ApiErrorResponse::InvalidRequestData { message })
+    {
+        return api::log_and_return_error_response(err.into());
+    };
+
+    if let Some(api_enums::CaptureMethod::Scheduled) = payload.capture_method {
+        return http_not_implemented();
+    };
+
+    if let Err(err) = get_or_generate_payment_id(&mut payload) {
+        return api::log_and_return_error_response(err);
+    }
+
+    let header_payload = match HeaderPayload::foreign_try_from(req.headers()) {
+        Ok(headers) => headers,
+        Err(err) => {
+            return api::log_and_return_error_response(err);
+        }
+    };
+
+    tracing::Span::current().record(
+        "payment_id",
+        payload
+            .payment_id
+            .as_ref()
+            .map(|payment_id_type| payment_id_type.get_payment_intent_id())
+            .transpose()
+            .unwrap_or_default()
+            .as_ref()
+            .map(|id| id.get_string_repr())
+            .unwrap_or_default(),
+    );
+
+    let locking_action = payload.get_locking_input(flow.clone());
+
     Box::pin(api::server_wrap(
         flow,
         state,
@@ -134,7 +306,11 @@ pub async fn payments_create(
                 api::AuthFlow::Client,
             )
         },
-        auth_type,
+        &auth::InternalMerchantIdProfileIdAuth(auth::JWTAuth {
+            permission: Permission::ProfilePaymentWrite,
+            allow_connected: true,
+            allow_platform: false,
+        }),
         locking_action,
     ))
     .await
@@ -589,6 +765,7 @@ pub async fn payments_start(
                 None,
                 None,
                 HeaderPayload::default(),
+                None,
             )
         },
         &auth::MerchantIdAuth(merchant_id),
@@ -679,6 +856,7 @@ pub async fn payments_retrieve(
                 None,
                 None,
                 header_payload.clone(),
+                None,
             )
         },
         auth::auth_type(
@@ -760,6 +938,7 @@ pub async fn payments_retrieve_with_gateway_creds(
                 None,
                 None,
                 HeaderPayload::default(),
+                None,
             )
         },
         &*auth_type,
@@ -809,26 +988,108 @@ pub async fn payments_update(
 
     let locking_action = payload.get_locking_input(flow.clone());
 
+    let header_payload = match HeaderPayload::foreign_try_from(req.headers()) {
+        Ok(headers) => headers,
+        Err(err) => {
+            return api::log_and_return_error_response(err);
+        }
+    };
+
+    let integration_type = server_integration::integration_type_from_headers(req.headers());
+
+    // Gated on merchant auth too: this route also accepts publishable-key + client-secret, and
+    // the enrichment runs as `AuthFlow::Merchant`, so a client caller must not opt in by header.
+    let enrich = integration_type.is_server() && auth_flow == api::AuthFlow::Merchant;
+
     Box::pin(api::server_wrap(
         flow,
         state,
         &req,
         payload,
-        |state, auth: auth::AuthenticationData, mut req, req_state| {
-            if let Some(client_secret) = auth.client_secret {
-                req.client_secret = Some(client_secret);
-            }
+        move |state, auth: auth::AuthenticationData, req, req_state| {
+            let header_payload = header_payload.clone();
+            async move {
+                let merchant_integration_type =
+                    server_integration::merchant_integration_type(&state, &auth.platform).await;
+                server_integration::validate_integration_type(
+                    integration_type,
+                    merchant_integration_type,
+                )?;
 
-            authorize_verify_select::<_>(
-                payments::PaymentUpdate,
-                state,
-                req_state,
-                auth.platform,
-                auth.profile.map(|profile| profile.get_id().clone()),
-                HeaderPayload::default(),
-                req,
-                auth_flow,
-            )
+                let profile_id = auth.profile.map(|profile| profile.get_id().clone());
+
+                // Only the enrichment path needs these afterwards. A client update — the vast
+                // majority — clones nothing.
+                let enrichment_inputs = enrich.then(|| {
+                    (
+                        state.clone(),
+                        req_state.clone(),
+                        auth.platform.clone(),
+                        profile_id.clone(),
+                        header_payload.clone(),
+                    )
+                });
+
+                let response = Box::pin(payments::payments_core::<
+                    api_types::UpdatePostConfirm,
+                    payment_types::PaymentsResponse,
+                    _,
+                    _,
+                    _,
+                    payments::PaymentData<api_types::UpdatePostConfirm>,
+                >(
+                    state,
+                    req_state,
+                    auth.platform,
+                    profile_id,
+                    payments::PaymentUpdate,
+                    req,
+                    auth_flow,
+                    payments::CallConnectorAction::Trigger,
+                    None,
+                    None,
+                    header_payload,
+                    None,
+                ))
+                .await?;
+
+                // Invoked directly, not through `server_wrap`: both flows map to
+                // `ApiIdentifier::Payments`, so a nested wrap would deadlock on the lock this
+                // request already holds.
+                let enrich_payment = |mut payment: payment_types::PaymentsResponse| async {
+                    if let Some((state, req_state, platform, profile_id, header_payload)) =
+                        enrichment_inputs
+                    {
+                        let id = payment.payment_id.clone();
+                        Box::pin(server_integration::attach_server_context(
+                            state,
+                            req_state,
+                            platform,
+                            profile_id,
+                            &id,
+                            header_payload,
+                            &mut payment,
+                        ))
+                        .await;
+                    }
+                    payment
+                };
+
+                // `enrich_payment` is a no-op when `enrichment_inputs` is `None`, so the opt-in
+                // decision lives in exactly one place rather than being re-tested here.
+                match response {
+                    services::ApplicationResponse::JsonWithHeaders((payment, headers)) => {
+                        Ok(services::ApplicationResponse::JsonWithHeaders((
+                            enrich_payment(payment).await,
+                            headers,
+                        )))
+                    }
+                    services::ApplicationResponse::Json(payment) => Ok(
+                        services::ApplicationResponse::Json(enrich_payment(payment).await),
+                    ),
+                    response => Ok(response),
+                }
+            }
         },
         &*auth_type,
         locking_action,
@@ -878,7 +1139,7 @@ pub async fn payments_post_session_tokens(
                     .map(|client_secret| client_secret.peek())
                     .check_value_present("client_secret")
                     .map_err(|_| errors::ApiErrorResponse::MissingRequiredField {
-                        field_name: "client_secret",
+                        field_name: "client_secret".into(),
                     }) {
                     Ok(_) => {}
                     Err(err) => return api::log_and_return_error_response(report!(err)),
@@ -921,6 +1182,7 @@ pub async fn payments_post_session_tokens(
                 None,
                 None,
                 header_payload.clone(),
+                None,
             )
         },
         &*auth,
@@ -979,6 +1241,7 @@ pub async fn payments_update_metadata(
                 None,
                 None,
                 header_payload.clone(),
+                None,
             )
         },
         &auth::HeaderAuth(auth::ApiKeyAuth {
@@ -1018,8 +1281,10 @@ pub async fn payments_confirm(
         }
     };
 
-    if let Err(err) = helpers::populate_browser_info(&req, &mut payload, &header_payload) {
-        return api::log_and_return_error_response(err);
+    if payload.retry_action != Some(api_enums::RetryAction::ManualRetry) {
+        if let Err(err) = helpers::populate_browser_info(&req, &mut payload, &header_payload) {
+            return api::log_and_return_error_response(err);
+        }
     }
 
     let payment_id = path.into_inner();
@@ -1049,22 +1314,33 @@ pub async fn payments_confirm(
         state,
         &req,
         payload,
-        |state, auth: auth::AuthenticationData, mut req, req_state| {
-            // If client_secret is provided via SDK authorization header, use it
-            if let Some(client_secret) = auth.client_secret {
-                req.client_secret = Some(client_secret);
-            }
+        |mut state, auth: auth::AuthenticationData, mut req, req_state| {
+            let header_payload = header_payload.clone();
+            async move {
+                let metrics_start = Instant::now();
+                let metrics_context =
+                    set_payment_confirm_metrics_context(&mut state, &auth.platform).await;
 
-            authorize_verify_select::<_>(
-                payments::PaymentConfirm,
-                state,
-                req_state,
-                auth.platform,
-                auth.profile.map(|profile| profile.get_id().clone()),
-                header_payload.clone(),
-                req,
-                auth_flow,
-            )
+                // If client_secret is provided via SDK authorization header, use it
+                if let Some(client_secret) = auth.client_secret {
+                    req.client_secret = Some(client_secret);
+                }
+
+                let result = Box::pin(authorize_verify_select::<_>(
+                    payments::PaymentConfirm,
+                    state,
+                    req_state,
+                    auth.platform,
+                    auth.profile.map(|profile| profile.get_id().clone()),
+                    header_payload,
+                    req,
+                    auth_flow,
+                ))
+                .await;
+
+                record_payment_confirm(&result, metrics_start.elapsed(), metrics_context);
+                result
+            }
         },
         &*auth_type,
         locking_action,
@@ -1116,12 +1392,21 @@ pub async fn payments_capture(
                 None,
                 None,
                 HeaderPayload::default(),
+                None,
             )
         },
-        &auth::HeaderAuth(auth::ApiKeyAuth {
-            allow_connected_scope_operation: true,
-            allow_platform_self_operation: false,
-        }),
+        auth::auth_type(
+            &auth::HeaderAuth(auth::ApiKeyAuth {
+                allow_connected_scope_operation: true,
+                allow_platform_self_operation: false,
+            }),
+            &auth::JWTAuth {
+                permission: Permission::ProfilePaymentWrite,
+                allow_connected: true,
+                allow_platform: false,
+            },
+            req.headers(),
+        ),
         locking_action,
     ))
     .await
@@ -1171,7 +1456,7 @@ pub async fn payments_dynamic_tax_calculation(
                     .map(|client_secret| client_secret.peek())
                     .check_value_present("client_secret")
                     .map_err(|_| errors::ApiErrorResponse::MissingRequiredField {
-                        field_name: "client_secret",
+                        field_name: "client_secret".into(),
                     }) {
                     Ok(_) => {}
                     Err(err) => return api::log_and_return_error_response(report!(err)),
@@ -1214,6 +1499,7 @@ pub async fn payments_dynamic_tax_calculation(
                 None,
                 None,
                 header_payload.clone(),
+                None,
             )
         },
         &*auth,
@@ -1326,7 +1612,7 @@ pub async fn payments_connector_session(
                     .client_secret
                     .check_value_present("client_secret")
                     .map_err(|_| errors::ApiErrorResponse::MissingRequiredField {
-                        field_name: "client_secret",
+                        field_name: "client_secret".into(),
                     }) {
                     Ok(_) => {}
                     Err(err) => return api::log_and_return_error_response(report!(err)),
@@ -1368,6 +1654,7 @@ pub async fn payments_connector_session(
                 None,
                 None,
                 header_payload.clone(),
+                None,
             )
         },
         &*auth,
@@ -1639,6 +1926,7 @@ pub async fn payments_complete_authorize(
                 None,
                 None,
                 HeaderPayload::default(),
+                None,
             )
         },
         &*auth_type,
@@ -1662,6 +1950,14 @@ pub async fn payments_cancel(
     tracing::Span::current().record("payment_id", payment_id.get_string_repr());
 
     payload.payment_id = payment_id;
+
+    let header_payload = match HeaderPayload::foreign_try_from(req.headers()) {
+        Ok(headers) => headers,
+        Err(err) => {
+            return api::log_and_return_error_response(err);
+        }
+    };
+
     let locking_action = payload.get_locking_input(flow.clone());
     Box::pin(api::server_wrap(
         flow,
@@ -1669,26 +1965,112 @@ pub async fn payments_cancel(
         &req,
         payload,
         |state, auth: auth::AuthenticationData, req, req_state| {
-            payments::payments_core::<
-                api_types::Void,
-                payment_types::PaymentsResponse,
-                _,
-                _,
-                _,
-                payments::PaymentData<api_types::Void>,
-            >(
-                state,
-                req_state,
-                auth.platform,
-                auth.profile.map(|profile| profile.get_id().clone()),
-                payments::PaymentCancel,
-                req,
-                api::AuthFlow::Merchant,
-                payments::CallConnectorAction::Trigger,
-                None,
-                None,
-                HeaderPayload::default(),
-            )
+            let header_payload = header_payload.clone();
+            async move {
+                let operation = payments::PaymentCancel;
+                let payment_id_type =
+                    payment_types::PaymentIdType::PaymentIntentId(req.payment_id.clone());
+
+                // Getting the intent status to determine which flow to use
+                let payment_pre_fetched_info = {
+                    let preliminary_dimensions = dimension_state::Dimensions::new()
+                        .with_processor_merchant_id(
+                            auth.platform.get_processor().get_processor_merchant_id(),
+                        )
+                        .with_provider_merchant_id(
+                            auth.platform.get_provider().get_provider_merchant_id(),
+                        );
+                    let tracker_response = operation
+                        .to_get_tracker()?
+                        .get_trackers(
+                            &state,
+                            &payment_id_type,
+                            &req,
+                            &auth.platform,
+                            api::AuthFlow::Merchant,
+                            payments::operations::PaymentFlowKind::Standard,
+                            &header_payload,
+                            crate::core::payment_methods::transformers::PaymentMethodFetchData::default(),
+                            &preliminary_dimensions,
+                            None
+                        )
+                        .await?;
+
+                    let get_tracker_payment_data: payments::PaymentData<api_types::Void> =
+                        tracker_response.payment_data;
+
+                    // Create PaymentPreFetchedInformation to pass to payments_core
+                        payments::operations::PaymentPreFetchedInformation {
+                            payment_intent: get_tracker_payment_data.payment_intent.clone(),
+                            payment_attempt: get_tracker_payment_data.payment_attempt.clone(),
+                        }
+                };
+
+                // Check if the payment status is RequiresCustomerAction and connector supports pre-authorize cancel
+                let supports_pre_authorize_cancel =
+                    if let Some(ref connector_name_str) = payment_pre_fetched_info.payment_attempt.connector {
+                        ConnectorData::get_connector_by_name(
+                            &state.conf.connectors,
+                            connector_name_str,
+                            GetToken::Connector,
+                            None,
+                        )
+                        .map(|connector_data| {
+                            connector_data.connector.is_pre_authorize_cancel_supported(payment_pre_fetched_info.payment_attempt.payment_method_type)
+                        })
+                        .unwrap_or(false)
+                    } else {
+                        false
+                    };
+
+                if payment_pre_fetched_info.payment_intent.status == api_enums::IntentStatus::RequiresCustomerAction
+                    && supports_pre_authorize_cancel
+                {
+                    Box::pin(payments::payments_core::<
+                        api_types::PreAuthorizeVoid,
+                        payment_types::PaymentsResponse,
+                        _,
+                        _,
+                        _,
+                        payments::PaymentData<api_types::PreAuthorizeVoid>,
+                    >(
+                        state,
+                        req_state,
+                        auth.platform,
+                        auth.profile.map(|profile| profile.get_id().clone()),
+                        operation,
+                        req,
+                        api::AuthFlow::Merchant,
+                        payments::CallConnectorAction::Trigger,
+                        None,
+                        None,
+                        header_payload.clone(),
+                        Some(payment_pre_fetched_info),))
+                    .await
+                } else {
+                    Box::pin(payments::payments_core::<
+                        api_types::Void,
+                        payment_types::PaymentsResponse,
+                        _,
+                        _,
+                        _,
+                        payments::PaymentData<api_types::Void>,
+                    >(
+                        state,
+                        req_state,
+                        auth.platform,
+                        auth.profile.map(|profile| profile.get_id().clone()),
+                        operation,
+                        req,
+                        api::AuthFlow::Merchant,
+                        payments::CallConnectorAction::Trigger,
+                        None,
+                        None,
+                        header_payload.clone(),
+                        Some(payment_pre_fetched_info),))
+                    .await
+                }
+            }
         },
         auth::auth_type(
             &auth::HeaderAuth(auth::ApiKeyAuth {
@@ -1825,6 +2207,57 @@ pub async fn payments_cancel_post_capture(
                 None,
                 None,
                 HeaderPayload::default(),
+                None,
+            )
+        },
+        &auth::HeaderAuth(auth::ApiKeyAuth {
+            allow_connected_scope_operation: true,
+            allow_platform_self_operation: false,
+        }),
+        locking_action,
+    ))
+    .await
+}
+
+#[cfg(feature = "v1")]
+#[instrument(skip_all, fields(flow = ?Flow::PaymentsCancelPostCaptureSync, payment_id))]
+pub async fn payments_cancel_post_capture_retrieve(
+    state: web::Data<app::AppState>,
+    req: actix_web::HttpRequest,
+    path: web::Path<common_utils::id_type::PaymentId>,
+) -> impl Responder {
+    let flow = Flow::PaymentsCancelPostCaptureSync;
+    let payment_id = path.into_inner();
+
+    tracing::Span::current().record("payment_id", payment_id.get_string_repr());
+
+    let locking_action = payment_id.get_locking_input(flow.clone());
+    Box::pin(api::server_wrap(
+        flow,
+        state,
+        &req,
+        payment_id,
+        |state, auth: auth::AuthenticationData, req, req_state| {
+            payments::payments_core::<
+                api_types::PostCaptureVoidSync,
+                payment_types::PaymentsResponse,
+                _,
+                _,
+                _,
+                payments::PaymentData<api_types::PostCaptureVoidSync>,
+            >(
+                state,
+                req_state,
+                auth.platform,
+                auth.profile.map(|profile| profile.get_id().clone()),
+                payments::PaymentCancelPostCaptureSync,
+                req,
+                api::AuthFlow::Merchant,
+                payments::CallConnectorAction::Trigger,
+                None,
+                None,
+                HeaderPayload::default(),
+                None,
             )
         },
         &auth::HeaderAuth(auth::ApiKeyAuth {
@@ -2218,6 +2651,7 @@ pub async fn payments_approve(
                 None,
                 None,
                 HeaderPayload::default(),
+                None,
             )
         },
         match env::which() {
@@ -2290,6 +2724,7 @@ pub async fn payments_reject(
                 None,
                 None,
                 HeaderPayload::default(),
+                None,
             )
         },
         match env::which() {
@@ -2316,6 +2751,27 @@ pub async fn payments_reject(
 }
 
 #[cfg(feature = "v1")]
+async fn set_payment_confirm_metrics_context(
+    state: &mut app::SessionState,
+    platform: &domain::Platform,
+) -> PaymentMetricsContext {
+    let dimensions = dimension_state::Dimensions::new()
+        .with_processor_merchant_id(platform.get_processor().get_processor_merchant_id())
+        .with_provider_merchant_id(platform.get_provider().get_provider_merchant_id());
+    let feature_config = get_feature_config(state, platform, &dimensions).await;
+    let context = PaymentMetricsContext::payments_confirm(MerchantMode::from_modular_enabled(
+        feature_config.is_payment_method_modular_allowed,
+    ));
+
+    state.payment_metrics_context = Some(context);
+    state
+        .store
+        .set_key_manager_state(KeyManagerState::from(&*state));
+
+    context
+}
+
+#[cfg(feature = "v1")]
 #[allow(clippy::too_many_arguments)]
 async fn authorize_verify_select<Op>(
     operation: Op,
@@ -2331,11 +2787,11 @@ where
     Op: Sync
         + Clone
         + std::fmt::Debug
-        + payments::operations::Operation<
+        + Operation<
             api_types::Authorize,
             api_models::payments::PaymentsRequest,
             Data = payments::PaymentData<api_types::Authorize>,
-        > + payments::operations::Operation<
+        > + Operation<
             api_types::SetupMandate,
             api_models::payments::PaymentsRequest,
             Data = payments::PaymentData<api_types::SetupMandate>,
@@ -2389,102 +2845,176 @@ where
             | api_models::enums::PaymentType::RecurringMandate
             | api_models::enums::PaymentType::NewMandate
             | api_models::enums::PaymentType::Installment => {
-                let (payment_data, _req, connector_http_status_code, external_latency) =
-                    Box::pin(payments::payments_operation_core::<
-                        api_types::Authorize,
-                        _,
-                        _,
-                        _,
-                        payments::PaymentData<api_types::Authorize>,
-                    >(
-                        &state,
-                        req_state.clone(),
-                        &platform,
-                        profile_id.clone(),
-                        operation.clone(),
-                        req.clone(),
-                        payments::CallConnectorAction::Trigger,
-                        None,
-                        auth_flow,
-                        eligible_routable_connectors.clone(),
-                        header_payload.clone(),
-                        &dimensions,
-                    ))
-                    .await?;
-
-                let connector = payment_data.get_payment_attempt_connector();
-
-                if let Some(connector_name) = connector {
-                    let connector_data = api_types::ConnectorData::get_connector_by_name(
-                        &state.conf.connectors,
-                        connector_name,
-                        api_types::GetToken::Connector,
-                        None,
-                    )?;
-                    let should_continue_further = connector_data
-                        .connector
-                        .is_payment_recurrence_operation_needed(
-                            &payment_data.payment_intent.clone(),
+                // The external vault proxy flow is non-PCI: the card is vaulted in an external
+                // vault. Two confirm shapes route here:
+                //   - `VaultDataCard`: inline vault card data.
+                //   - `VaultCardTokenData`: a saved card referenced by the top-level
+                //     `payment_token`; its vault tokens are retrieved from the modular PM service.
+                // In both cases the confirm request itself is used to call the proxy core
+                // directly — no conversion to a dedicated proxy request.
+                let should_call_external_vault_proxy = req
+                    .payment_method_data
+                    .as_ref()
+                    .and_then(|pmd| pmd.payment_method_data.as_ref())
+                    .map(|data| {
+                        matches!(
+                            data,
+                            api_models::payments::PaymentMethodData::ProxyCard(_)
+                                | api_models::payments::PaymentMethodData::VaultCardTokenData(_)
                         )
-                        .unwrap_or(false);
-                    if should_continue_further {
-                        logger::info!(
+                    })
+                    .unwrap_or(false);
+
+                if should_call_external_vault_proxy {
+                    // A single-call create+confirm (the create endpoint with `confirm = true`)
+                    // reaches here before any intent exists, so drive the proxy core with
+                    // `PaymentCreate`: it persists the intent/attempt and swaps to
+                    // `PaymentExternalVaultProxyConfirm` for the downstream connector call. The
+                    // standalone confirm endpoint already has an intent, so it runs the proxy
+                    // confirm operation directly.
+                    let is_payment_create = format!("{operation:?}") == "PaymentCreate";
+                    if is_payment_create {
+                        Box::pin(payments::external_vault_proxy_for_payments_core::<
+                            api_types::ExternalVaultProxy,
+                            payment_types::PaymentsResponse,
+                            _,
+                            _,
+                            _,
+                            payments::PaymentData<api_types::ExternalVaultProxy>,
+                        >(
+                            state,
+                            req_state,
+                            platform,
+                            profile_id,
+                            payments::PaymentCreate,
+                            req,
+                            auth_flow,
+                            payments::CallConnectorAction::Trigger,
+                            header_payload,
+                            None,
+                        ))
+                        .await
+                    } else {
+                        Box::pin(payments::external_vault_proxy_for_payments_core::<
+                            api_types::ExternalVaultProxy,
+                            payment_types::PaymentsResponse,
+                            _,
+                            _,
+                            _,
+                            payments::PaymentData<api_types::ExternalVaultProxy>,
+                        >(
+                            state,
+                            req_state,
+                            platform,
+                            profile_id,
+                            payments::PaymentExternalVaultProxyConfirm,
+                            req,
+                            auth_flow,
+                            payments::CallConnectorAction::Trigger,
+                            header_payload,
+                            None,
+                        ))
+                        .await
+                    }
+                } else {
+                    let (payment_data, _req, connector_http_status_code, external_latency) =
+                        Box::pin(payments::payments_operation_core::<
+                            api_types::Authorize,
+                            _,
+                            _,
+                            _,
+                            payments::PaymentData<api_types::Authorize>,
+                        >(
+                            &state,
+                            req_state.clone(),
+                            &platform,
+                            profile_id.clone(),
+                            operation.clone(),
+                            req.clone(),
+                            payments::CallConnectorAction::Trigger,
+                            None,
+                            auth_flow,
+                            eligible_routable_connectors.clone(),
+                            header_payload.clone(),
+                            &dimensions,
+                            None,
+                        ))
+                        .await?;
+
+                    let connector = payment_data.get_payment_attempt_connector();
+
+                    if let Some(connector_name) = connector {
+                        let connector_data = ConnectorData::get_connector_by_name(
+                            &state.conf.connectors,
+                            connector_name,
+                            GetToken::Connector,
+                            None,
+                        )?;
+                        let setup_future_usage = payment_data.payment_intent.setup_future_usage;
+                        let should_continue_further = connector_data
+                            .connector
+                            .is_payment_recurrence_operation_needed(setup_future_usage, None)
+                            .unwrap_or(false);
+                        if should_continue_further {
+                            logger::info!(
                             "Re-invoking payments_operation_core | should_continue_further: {} | payment_id: {:?}",
                             should_continue_further,
                             payment_data.get_payment_intent().payment_id,
                         );
-                        let (pd, _req, connector_status_code, ext_latency) =
-                            Box::pin(payments::payments_operation_core::<
-                                api_types::SetupMandate,
-                                _,
-                                _,
-                                _,
-                                payments::PaymentData<api_types::SetupMandate>,
-                            >(
-                                &state,
-                                req_state,
-                                &platform,
-                                profile_id,
-                                PaymentRecurrence,
-                                req,
-                                payments::CallConnectorAction::Trigger,
-                                None,
+                            let (pd, _req, connector_status_code, ext_latency) =
+                                Box::pin(payments::payments_operation_core::<
+                                    api_types::SetupMandate,
+                                    _,
+                                    _,
+                                    _,
+                                    payments::PaymentData<api_types::SetupMandate>,
+                                >(
+                                    &state,
+                                    req_state,
+                                    &platform,
+                                    profile_id,
+                                    PaymentRecurrence,
+                                    req,
+                                    payments::CallConnectorAction::Trigger,
+                                    None,
+                                    auth_flow,
+                                    eligible_routable_connectors,
+                                    header_payload.clone(),
+                                    &dimensions,
+                                    None,
+                                ))
+                                .await?;
+                            let total_ext_latency = match (external_latency, ext_latency) {
+                                (Some(l1), Some(l2)) => Some(l1 + l2),
+                                (Some(l), None) | (None, Some(l)) => Some(l),
+                                (None, None) => None,
+                            };
+                            return payment_types::PaymentsResponse::generate_response(
+                                pd,
                                 auth_flow,
-                                eligible_routable_connectors,
-                                header_payload.clone(),
-                                &dimensions,
-                            ))
-                            .await?;
-                        let total_ext_latency = match (external_latency, ext_latency) {
-                            (Some(l1), Some(l2)) => Some(l1 + l2),
-                            (Some(l), None) | (None, Some(l)) => Some(l),
-                            (None, None) => None,
-                        };
-                        return payment_types::PaymentsResponse::generate_response(
-                            pd,
-                            auth_flow,
-                            &state.base_url,
-                            operation,
-                            &state.conf.connector_request_reference_id_config,
-                            connector_status_code,
-                            total_ext_latency,
-                            header_payload.x_hs_latency,
-                            &platform,
-                        );
+                                &state.base_url,
+                                operation,
+                                &state.conf.connector_request_reference_id_config,
+                                connector_status_code,
+                                total_ext_latency,
+                                header_payload.x_hs_latency,
+                                &platform,
+                            );
+                        }
                     }
-                }
 
-                payment_types::PaymentsResponse::generate_response(
-                    payment_data,
-                    auth_flow,
-                    &state.base_url,
-                    operation,
-                    &state.conf.connector_request_reference_id_config,
-                    connector_http_status_code,
-                    external_latency,
-                    header_payload.x_hs_latency,
-                    &platform,
-                )
+                    payment_types::PaymentsResponse::generate_response(
+                        payment_data,
+                        auth_flow,
+                        &state.base_url,
+                        operation,
+                        &state.conf.connector_request_reference_id_config,
+                        connector_http_status_code,
+                        external_latency,
+                        header_payload.x_hs_latency,
+                        &platform,
+                    )
+                }
             }
             api_models::enums::PaymentType::SetupMandate => {
                 payments::payments_core::<
@@ -2506,6 +3036,7 @@ where
                     None,
                     eligible_connectors,
                     header_payload,
+                    None,
                 )
                 .await
             }
@@ -2554,6 +3085,7 @@ pub async fn payments_incremental_authorization(
                 None,
                 None,
                 HeaderPayload::default(),
+                None,
             )
         },
         &auth::HeaderAuth(auth::ApiKeyAuth {
@@ -2604,6 +3136,7 @@ pub async fn payments_extend_authorization(
                 None,
                 None,
                 HeaderPayload::default(),
+                None,
             )
         },
         &auth::HeaderAuth(auth::ApiKeyAuth {
@@ -2649,7 +3182,7 @@ pub async fn payments_external_authentication(
                     .map(|client_secret| client_secret.peek())
                     .check_value_present("client_secret")
                     .map_err(|_| errors::ApiErrorResponse::MissingRequiredField {
-                        field_name: "client_secret",
+                        field_name: "client_secret".into(),
                     }) {
                     Ok(_) => {}
                     Err(err) => return api::log_and_return_error_response(report!(err)),
@@ -2825,6 +3358,53 @@ pub async fn retrieve_extended_card_info(
             allow_connected_scope_operation: true,
             allow_platform_self_operation: false,
         }),
+        api_locking::LockAction::NotApplicable,
+    ))
+    .await
+}
+
+#[cfg(all(feature = "oltp", feature = "v1"))]
+#[instrument(skip_all, fields(flow = ?Flow::PaymentsSubmitCheckEligibility, payment_id))]
+pub async fn payments_submit_eligibility_check(
+    state: web::Data<app::AppState>,
+    http_req: actix_web::HttpRequest,
+    json_payload: web::Json<payment_types::PaymentsEligibilityCheckRequest>,
+    path: web::Path<common_utils::id_type::PaymentId>,
+) -> impl Responder {
+    let flow = Flow::PaymentsSubmitCheckEligibility;
+    let payment_id = path.into_inner();
+    let mut payload = json_payload.into_inner();
+    payload.payment_id = payment_id.clone();
+
+    let api_auth = auth::ApiKeyAuth {
+        allow_connected_scope_operation: true,
+        allow_platform_self_operation: false,
+    };
+
+    let (auth_type, _auth_flow) =
+        match auth::check_sdk_auth_and_get_auth(http_req.headers(), &payload, api_auth) {
+            Ok(auth) => auth,
+            Err(err) => return api::log_and_return_error_response(report!(err)),
+        };
+
+    Box::pin(api::server_wrap(
+        flow,
+        state,
+        &http_req,
+        payment_id,
+        |state, auth: auth::AuthenticationData, payment_id, _| {
+            let mut payload = payload.clone();
+            if let Some(client_secret) = auth.client_secret {
+                payload.client_secret = Some(Secret::new(client_secret));
+            }
+            payments::payments_submit_eligibility_check(
+                state,
+                auth.platform,
+                payload.clone(),
+                payment_id,
+            )
+        },
+        &*auth_type,
         api_locking::LockAction::NotApplicable,
     ))
     .await
@@ -3141,6 +3721,23 @@ impl GetLockingInput for payment_types::PaymentsCancelPostCaptureRequest {
         api_locking::LockAction::Hold {
             input: api_locking::LockingInput {
                 unique_locking_key: self.payment_id.get_string_repr().to_owned(),
+                api_identifier: lock_utils::ApiIdentifier::from(flow),
+                override_lock_retries: None,
+            },
+        }
+    }
+}
+
+#[cfg(feature = "v1")]
+impl GetLockingInput for common_utils::id_type::PaymentId {
+    fn get_locking_input<F>(&self, flow: F) -> api_locking::LockAction
+    where
+        F: types::FlowMetric,
+        lock_utils::ApiIdentifier: From<F>,
+    {
+        api_locking::LockAction::Hold {
+            input: api_locking::LockingInput {
+                unique_locking_key: self.get_string_repr().to_owned(),
                 api_identifier: lock_utils::ApiIdentifier::from(flow),
                 override_lock_retries: None,
             },
@@ -3689,8 +4286,7 @@ pub async fn confirm_intent_with_external_vault_proxy(
                 payment_id,
                 payments::CallConnectorAction::Trigger,
                 header_payload.clone(),
-                None,
-            ))
+                None,))
         },
         auth::api_or_client_auth(
             &auth::V2ApiKeyAuth {

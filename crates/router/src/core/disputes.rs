@@ -13,6 +13,7 @@ use strum::IntoEnumIterator;
 pub mod transformers;
 
 use common_enums;
+use hyperswitch_interfaces::webhooks::WebhookResourceData;
 
 use super::{
     errors::{self, ConnectorErrorExt, RouterResponse, StorageErrorExt},
@@ -60,6 +61,7 @@ pub async fn retrieve_dispute(
         .find_dispute_by_processor_merchant_id_dispute_id(
             platform.get_processor().get_account().get_id(),
             &req.dispute_id,
+            platform.get_processor().get_account().storage_scheme,
         )
         .await
         .to_not_found_response(errors::ApiErrorResponse::DisputeNotFound {
@@ -85,9 +87,10 @@ pub async fn retrieve_dispute(
             core_utils::validate_profile_id_from_auth_layer(profile_id.clone(), &dispute)?;
 
             let payment_attempt = db
-                .find_payment_attempt_by_attempt_id_processor_merchant_id(
-                    &dispute.attempt_id,
+                .find_payment_attempt_by_payment_id_processor_merchant_id_attempt_id(
+                    &dispute.payment_id,
                     platform.get_processor().get_account().get_id(),
+                    &dispute.attempt_id,
                     platform.get_processor().get_account().storage_scheme,
                     platform.get_processor().get_key_store(),
                 )
@@ -189,7 +192,11 @@ pub async fn retrieve_disputes_list(
     let dispute_list_constraints = &(constraints.clone(), profile_id_list.clone()).try_into()?;
     let disputes = state
         .store
-        .find_disputes_by_constraints(processor.get_account().get_id(), dispute_list_constraints)
+        .find_disputes_by_constraints(
+            processor.get_account().get_id(),
+            dispute_list_constraints,
+            processor.get_account().storage_scheme,
+        )
         .await
         .to_not_found_response(errors::ApiErrorResponse::InternalServerError)
         .attach_printable("Unable to retrieve disputes")?;
@@ -296,6 +303,7 @@ pub async fn accept_dispute(
         .find_dispute_by_processor_merchant_id_dispute_id(
             processor.get_account().get_id(),
             &req.dispute_id,
+            processor.get_account().storage_scheme,
         )
         .await
         .to_not_found_response(errors::ApiErrorResponse::DisputeNotFound {
@@ -330,9 +338,10 @@ pub async fn accept_dispute(
         .change_context(errors::ApiErrorResponse::PaymentNotFound)?;
 
     let payment_attempt = db
-        .find_payment_attempt_by_attempt_id_processor_merchant_id(
-            &dispute.attempt_id,
+        .find_payment_attempt_by_payment_id_processor_merchant_id_attempt_id(
+            &dispute.payment_id,
             processor.get_account().get_id(),
+            &dispute.attempt_id,
             processor.get_account().storage_scheme,
             processor.get_key_store(),
         )
@@ -383,7 +392,11 @@ pub async fn accept_dispute(
         connector_status: accept_dispute_response.connector_status.clone(),
     };
     let updated_dispute = db
-        .update_dispute(dispute.clone(), update_dispute)
+        .update_dispute(
+            dispute.clone(),
+            update_dispute,
+            processor.get_account().storage_scheme,
+        )
         .await
         .change_context(errors::ApiErrorResponse::InternalServerError)
         .attach_printable_lazy(|| {
@@ -418,6 +431,7 @@ pub async fn submit_evidence(
         .find_dispute_by_processor_merchant_id_dispute_id(
             processor.get_account().get_id(),
             &req.dispute_id,
+            processor.get_account().storage_scheme,
         )
         .await
         .to_not_found_response(errors::ApiErrorResponse::DisputeNotFound {
@@ -454,9 +468,10 @@ pub async fn submit_evidence(
         .change_context(errors::ApiErrorResponse::PaymentNotFound)?;
 
     let payment_attempt = db
-        .find_payment_attempt_by_attempt_id_processor_merchant_id(
-            &dispute.attempt_id,
+        .find_payment_attempt_by_payment_id_processor_merchant_id_attempt_id(
+            &dispute.payment_id,
             processor.get_account().get_id(),
+            &dispute.attempt_id,
             processor.get_account().storage_scheme,
             processor.get_key_store(),
         )
@@ -557,7 +572,11 @@ pub async fn submit_evidence(
         connector_status,
     };
     let updated_dispute = db
-        .update_dispute(dispute.clone(), update_dispute)
+        .update_dispute(
+            dispute.clone(),
+            update_dispute,
+            processor.get_account().storage_scheme,
+        )
         .await
         .to_not_found_response(errors::ApiErrorResponse::DisputeNotFound {
             dispute_id: dispute_id.to_owned(),
@@ -585,6 +604,7 @@ pub async fn attach_evidence(
         .find_dispute_by_processor_merchant_id_dispute_id(
             platform.get_processor().get_account().get_id(),
             &dispute_id,
+            platform.get_processor().get_account().storage_scheme,
         )
         .await
         .to_not_found_response(errors::ApiErrorResponse::DisputeNotFound {
@@ -604,6 +624,7 @@ pub async fn attach_evidence(
             })
         },
     )?;
+    let storage_scheme = platform.get_processor().get_account().storage_scheme;
     let create_file_response = Box::pin(files::files_create_core(
         state.clone(),
         platform,
@@ -633,7 +654,7 @@ pub async fn attach_evidence(
             .attach_printable("Error while encoding dispute evidence")?
             .into(),
     };
-    db.update_dispute(dispute, update_dispute)
+    db.update_dispute(dispute, update_dispute, storage_scheme)
         .await
         .to_not_found_response(errors::ApiErrorResponse::DisputeNotFound {
             dispute_id: dispute_id.to_owned(),
@@ -656,6 +677,7 @@ pub async fn retrieve_dispute_evidence(
         .find_dispute_by_processor_merchant_id_dispute_id(
             processor.get_account().get_id(),
             &req.dispute_id,
+            processor.get_account().storage_scheme,
         )
         .await
         .to_not_found_response(errors::ApiErrorResponse::DisputeNotFound {
@@ -684,6 +706,7 @@ pub async fn delete_evidence(
         .find_dispute_by_processor_merchant_id_dispute_id(
             processor.get_account().get_id(),
             &dispute_id,
+            processor.get_account().storage_scheme,
         )
         .await
         .to_not_found_response(errors::ApiErrorResponse::DisputeNotFound {
@@ -706,7 +729,11 @@ pub async fn delete_evidence(
     };
     state
         .store
-        .update_dispute(dispute, update_dispute)
+        .update_dispute(
+            dispute,
+            update_dispute,
+            processor.get_account().storage_scheme,
+        )
         .await
         .to_not_found_response(errors::ApiErrorResponse::DisputeNotFound {
             dispute_id: dispute_id.to_owned(),
@@ -730,6 +757,7 @@ pub async fn get_aggregates_for_disputes(
             processor.get_account().get_id(),
             profile_id_list,
             &time_range,
+            processor.get_account().storage_scheme,
         )
         .await
         .change_context(errors::ApiErrorResponse::InternalServerError)
@@ -766,12 +794,12 @@ pub async fn connector_sync_disputes(
         .attach_printable("Failed to parse the date-time format")?;
     let created_from = time::PrimitiveDateTime::parse(&payload.fetch_from, &format)
         .change_context(errors::ApiErrorResponse::InvalidDataFormat {
-            field_name: "fetch_from".to_string(),
+            field_name: "fetch_from".into(),
             expected_format: "YYYY-MM-DDTHH:MM:SS".to_string(),
         })?;
     let created_till = time::PrimitiveDateTime::parse(&payload.fetch_till, &format)
         .change_context(errors::ApiErrorResponse::InvalidDataFormat {
-            field_name: "fetch_till".to_string(),
+            field_name: "fetch_till".into(),
             expected_format: "YYYY-MM-DDTHH:MM:SS".to_string(),
         })?;
     let fetch_dispute_request = FetchDisputesRequestData {
@@ -954,6 +982,8 @@ pub async fn update_dispute_data(
         api::OutgoingWebhookContent::DisputeDetails(Box::new(disputes_response.clone())),
         Some(dispute_object.created_at),
         webhook_recipient,
+        Some(WebhookResourceData::Payment { payment_attempt }),
+        business_profile,
     ))
     .await?;
     Ok(disputes_response)
@@ -1064,14 +1094,12 @@ pub async fn schedule_dispute_sync_task(
 ) -> common_utils::errors::CustomResult<(), errors::ApiErrorResponse> {
     let connector = api::enums::Connector::from_str(&mca.connector_name).change_context(
         errors::ApiErrorResponse::InvalidDataValue {
-            field_name: "connector",
+            field_name: "connector".into(),
         },
     )?;
 
     if core_utils::should_add_dispute_sync_task_to_pt(state, connector) {
-        let offset_date_time = time::OffsetDateTime::now_utc();
-        let created_from =
-            time::PrimitiveDateTime::new(offset_date_time.date(), offset_date_time.time());
+        let created_from = common_utils::date_time::now();
         let dispute_polling_interval = *business_profile
             .dispute_polling_interval
             .unwrap_or_default()

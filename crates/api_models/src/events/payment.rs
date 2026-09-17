@@ -22,9 +22,9 @@ use crate::{
         PaymentMethodUpdate,
     },
     payments::{
-        self, PaymentListConstraints, PaymentListFilters, PaymentListFiltersV2,
-        PaymentListResponse, PaymentsAggregateResponse, PaymentsSessionResponse,
-        RedirectionResponse,
+        self, PaymentLinkListResponse, PaymentListConstraints, PaymentListFilters,
+        PaymentListFiltersV2, PaymentListResponse, PaymentsAggregateResponse,
+        PaymentsSessionResponse, RedirectionResponse,
     },
 };
 #[cfg(feature = "v1")]
@@ -151,6 +151,7 @@ impl ApiEventMetric for PaymentsCancelPostCaptureRequest {
         })
     }
 }
+
 #[cfg(feature = "v1")]
 impl ApiEventMetric for PaymentsExtendAuthorizationRequest {
     fn get_api_event_type(&self) -> Option<ApiEventsType> {
@@ -187,6 +188,24 @@ impl ApiEventMetric for payments::PaymentsRequest {
             }),
             _ => None,
         }
+    }
+}
+
+#[cfg(feature = "v1")]
+impl ApiEventMetric for payments::PaymentsEligibilityCheckRequest {
+    fn get_api_event_type(&self) -> Option<ApiEventsType> {
+        Some(ApiEventsType::Payment {
+            payment_id: self.payment_id.clone(),
+        })
+    }
+}
+
+#[cfg(feature = "v1")]
+impl ApiEventMetric for payments::PaymentsEligibilityCheckResponse {
+    fn get_api_event_type(&self) -> Option<ApiEventsType> {
+        Some(ApiEventsType::Payment {
+            payment_id: self.payment_id.clone(),
+        })
     }
 }
 
@@ -368,6 +387,8 @@ impl ApiEventMetric for PaymentMethodMigrateResponse {
     }
 }
 
+impl ApiEventMetric for payment_methods::ModularPaymentMethodMigrationResponse {}
+
 impl ApiEventMetric for PaymentMethodUpdate {}
 
 #[cfg(feature = "v1")]
@@ -525,6 +546,12 @@ impl ApiEventMetric for PaymentListConstraints {
 }
 
 impl ApiEventMetric for PaymentListResponse {
+    fn get_api_event_type(&self) -> Option<ApiEventsType> {
+        Some(ApiEventsType::ResourceListAPI)
+    }
+}
+
+impl ApiEventMetric for PaymentLinkListResponse {
     fn get_api_event_type(&self) -> Option<ApiEventsType> {
         Some(ApiEventsType::ResourceListAPI)
     }

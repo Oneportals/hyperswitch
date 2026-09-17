@@ -2,6 +2,7 @@ use std::{collections::HashMap, marker::PhantomData};
 
 use api_models::customers::CustomerDocumentDetails;
 use cards::NetworkToken;
+use common_enums::WalletDecryptedToken;
 use common_types::{payments as common_payment_types, primitive_wrappers};
 use common_utils::{
     errors::IntegrityCheckError,
@@ -15,7 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     address::AddressDetails, payment_address::PaymentAddress, payment_method_data, payments,
-    router_response_types,
+    router_response_types, transformers::ForeignFrom,
 };
 #[cfg(feature = "v2")]
 use crate::{
@@ -123,10 +124,15 @@ pub struct RouterData<Flow, Request, Response> {
 
     // Document details of the customer consisting of document number and type
     pub customer_document_details: Option<CustomerDocumentDetails>,
+    /// The customer's date of birth.
+    pub customer_date_of_birth: Option<Secret<time::Date>>,
     // feature related data
     pub feature_data: Option<FeatureData>,
     /// A connector-specific identifier representing the stored payment instrument
     pub sender_payment_instrument_id: Option<String>,
+
+    /// Payment method details returned by the connector
+    pub connector_returned_payment_method_details: Option<payment_method_data::PaymentMethodData>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -156,6 +162,29 @@ pub struct OrderInfo {
     pub duty_amount: Option<MinorUnit>,
 }
 
+impl OrderInfo {
+    /// True when no order-info field carries data. Destructures the struct so
+    /// a newly added field forces this check to be revisited by the compiler.
+    pub fn is_empty(&self) -> bool {
+        let Self {
+            order_date,
+            order_details,
+            merchant_order_reference_id,
+            discount_amount,
+            shipping_cost,
+            duty_amount,
+        } = self;
+        order_date.is_none()
+            && order_details
+                .as_ref()
+                .is_none_or(|details| details.is_empty())
+            && merchant_order_reference_id.is_none()
+            && discount_amount.is_none()
+            && shipping_cost.is_none()
+            && duty_amount.is_none()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaxInfo {
     pub tax_status: Option<common_enums::TaxStatus>,
@@ -163,6 +192,25 @@ pub struct TaxInfo {
     pub merchant_tax_registration_id: Option<Secret<String>>,
     pub shipping_amount_tax: Option<MinorUnit>,
     pub order_tax_amount: Option<MinorUnit>,
+}
+
+impl TaxInfo {
+    /// True when no tax-info field carries data. Destructures the struct so a
+    /// newly added field forces this check to be revisited by the compiler.
+    pub fn is_empty(&self) -> bool {
+        let Self {
+            tax_status,
+            customer_tax_registration_id,
+            merchant_tax_registration_id,
+            shipping_amount_tax,
+            order_tax_amount,
+        } = self;
+        tax_status.is_none()
+            && customer_tax_registration_id.is_none()
+            && merchant_tax_registration_id.is_none()
+            && shipping_amount_tax.is_none()
+            && order_tax_amount.is_none()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -457,6 +505,23 @@ pub enum PaymentMethodToken {
     PazeDecrypt(Box<PazeDecryptedData>),
 }
 
+impl ForeignFrom<(Option<&PaymentMethodToken>, bool)> for WalletDecryptedToken {
+    fn foreign_from(
+        (from, should_save_walled_decrypted_token): (Option<&PaymentMethodToken>, bool),
+    ) -> Self {
+        if should_save_walled_decrypted_token {
+            match from {
+                Some(PaymentMethodToken::ApplePayDecrypt(_)) => Self::ApplePay,
+                Some(PaymentMethodToken::GooglePayDecrypt(_)) => Self::GooglePay,
+                Some(PaymentMethodToken::PazeDecrypt(_))
+                | Some(PaymentMethodToken::Token(_))
+                | None => Self::None,
+            }
+        } else {
+            Self::None
+        }
+    }
+}
 impl PaymentMethodToken {
     pub fn get_payment_method_token(&self) -> Option<Secret<String>> {
         match self {
@@ -465,8 +530,28 @@ impl PaymentMethodToken {
         }
     }
 
+    pub fn get_google_pay_decrypt_data(&self) -> Option<common_payment_types::GPayPredecryptData> {
+        match self {
+            Self::GooglePayDecrypt(data) => Some((**data).clone()),
+            Self::ApplePayDecrypt(_) | Self::PazeDecrypt(_) | Self::Token(_) => None,
+        }
+    }
+
+    pub fn get_apple_pay_decrypt_data(
+        &self,
+    ) -> Option<common_payment_types::ApplePayPredecryptData> {
+        match self {
+            Self::ApplePayDecrypt(data) => Some((**data).clone()),
+            Self::GooglePayDecrypt(_) | Self::PazeDecrypt(_) | Self::Token(_) => None,
+        }
+    }
+
     pub fn is_apple_pay_decrypt(&self) -> bool {
         matches!(self, Self::ApplePayDecrypt(_))
+    }
+
+    pub fn is_google_pay_decrypt(&self) -> bool {
+        matches!(self, Self::GooglePayDecrypt(_))
     }
 }
 
@@ -507,6 +592,7 @@ impl TryFrom<ApplePayPredecryptDataInternal> for common_payment_types::ApplePayP
 impl From<GooglePayPredecryptDataInternal> for common_payment_types::GPayPredecryptData {
     fn from(data: GooglePayPredecryptDataInternal) -> Self {
         Self {
+            auth_method: Some(data.payment_method_details.auth_method),
             card_exp_month: Secret::new(data.payment_method_details.expiration_month.two_digits()),
             card_exp_year: Secret::new(data.payment_method_details.expiration_year.four_digits()),
             application_primary_account_number: data.payment_method_details.pan.clone(),
@@ -557,6 +643,9 @@ impl ApplePayPredecryptDataInternal {
 pub struct GooglePayPredecryptDataInternal {
     pub message_expiration: String,
     pub message_id: String,
+    /// Present when the card was tokenized for a gateway, carrying the `gateway_merchant_id` that
+    /// was sent to Google in the session response. Absent for `DIRECT` tokenization.
+    pub gateway_merchant_id: Option<String>,
     #[serde(rename = "paymentMethod")]
     pub payment_method_type: String,
     pub payment_method_details: GooglePayPaymentMethodDetails,
@@ -665,11 +754,26 @@ impl ConnectorResponseData {
             common_enums::PaymentMethodType::GooglePay => {
                 AdditionalPaymentMethodConnectorResponse::GooglePay {
                     auth_code: Some(auth_code),
+                    device_pan_bin: None,
+                    card_bin: None,
+                    card_subtype: None,
+                    card_segment_type: None,
+                    funding_source: None,
+                    card_type: None,
+                    issuer_name: None,
+                    issuer_country: None,
                 }
             }
             common_enums::PaymentMethodType::ApplePay => {
                 AdditionalPaymentMethodConnectorResponse::ApplePay {
                     auth_code: Some(auth_code),
+                    device_pan_bin: None,
+                    card_bin: None,
+                    card_subtype: None,
+                    card_segment_type: None,
+                    funding_source: None,
+                    issuer_name: None,
+                    issuer_country: None,
                 }
             }
             _ => AdditionalPaymentMethodConnectorResponse::Card {
@@ -748,9 +852,45 @@ pub enum AdditionalPaymentMethodConnectorResponse {
     },
     GooglePay {
         auth_code: Option<String>,
+        /// Bin of the DPAN (device PAN), as returned by the connector
+        device_pan_bin: Option<String>,
+        /// Bin of the underlying card, as returned by the connector
+        card_bin: Option<String>,
+        /// The card's product/subtype, as returned by the connector
+        card_subtype: Option<String>,
+        /// The card's segment (e.g. consumer, commercial), as returned by the connector
+        card_segment_type: Option<common_enums::CardSegmentType>,
+        /// The card's funding source (e.g. credit, debit), as returned by the connector
+        funding_source: Option<common_enums::FundingSource>,
+        /// The card's type (e.g. credit, debit), as returned by the connector
+        card_type: Option<common_enums::CardType>,
+        /// The name of the card issuer, as returned by the connector
+        issuer_name: Option<String>,
+        /// The country of the card issuer, as returned by the connector
+        issuer_country: Option<common_enums::CountryAlpha2>,
     },
     ApplePay {
         auth_code: Option<String>,
+        /// Bin of the DPAN (device PAN), as returned by the connector
+        device_pan_bin: Option<String>,
+        /// Bin of the underlying card, as returned by the connector
+        card_bin: Option<String>,
+        /// The card's product/subtype, as returned by the connector
+        card_subtype: Option<String>,
+        /// The card's segment (e.g. consumer, commercial), as returned by the connector
+        card_segment_type: Option<common_enums::CardSegmentType>,
+        /// The card's funding source (e.g. credit, debit), as returned by the connector
+        funding_source: Option<common_enums::FundingSource>,
+        /// The name of the card issuer, as returned by the connector
+        issuer_name: Option<String>,
+        /// The country of the card issuer, as returned by the connector
+        issuer_country: Option<common_enums::CountryAlpha2>,
+    },
+    Paypal {
+        /// Email address associated with the payer's PayPal account
+        email: Option<common_utils::pii::Email>,
+        /// Unique identifier of the payer in PayPal
+        payer_id: Option<Secret<String>>,
     },
     SepaBankTransfer {
         debitor_iban: Option<Secret<String>>,

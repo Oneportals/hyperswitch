@@ -7,7 +7,8 @@ pub use api_models::payments::{
 #[cfg(feature = "v1")]
 pub use api_models::payments::{
     PaymentListFilterConstraints, PaymentListResponse, PaymentListResponseV2, PaymentRetrieveBody,
-    PaymentRetrieveBodyWithCredentials, PaymentsEligibilityRequest,
+    PaymentRetrieveBodyWithCredentials, PaymentsEligibilityCheckRequest,
+    PaymentsEligibilityRequest,
 };
 pub use api_models::{
     feature_matrix::{
@@ -25,13 +26,14 @@ pub use api_models::{
         PaymentsDynamicTaxCalculationRequest, PaymentsDynamicTaxCalculationResponse,
         PaymentsExtendAuthorizationRequest, PaymentsExternalAuthenticationRequest,
         PaymentsIncrementalAuthorizationRequest, PaymentsManualUpdateRequest,
-        PaymentsPostSessionTokensRequest, PaymentsPostSessionTokensResponse,
-        PaymentsRedirectRequest, PaymentsRedirectionResponse, PaymentsRejectRequest,
-        PaymentsRequest, PaymentsResponse, PaymentsResponseForm, PaymentsRetrieveRequest,
-        PaymentsSessionRequest, PaymentsSessionResponse, PaymentsStartRequest,
-        PaymentsUpdateMetadataRequest, PaymentsUpdateMetadataResponse, PgRedirectResponse,
-        PhoneDetails, RedirectionResponse, SessionToken, UrlDetails, VaultDetails,
-        VaultSessionDetails, VerifyRequest, VerifyResponse, VgsSessionDetails, WalletData,
+        PaymentsPostCaptureVoidSyncTrackingData, PaymentsPostSessionTokensRequest,
+        PaymentsPostSessionTokensResponse, PaymentsRedirectRequest, PaymentsRedirectionResponse,
+        PaymentsRejectRequest, PaymentsRequest, PaymentsResponse, PaymentsResponseForm,
+        PaymentsRetrieveRequest, PaymentsSessionRequest, PaymentsSessionResponse,
+        PaymentsStartRequest, PaymentsUpdateMetadataRequest, PaymentsUpdateMetadataResponse,
+        PgRedirectResponse, PhoneDetails, ProxyPaymentMethodData, ProxyPaymentMethodDataRequest,
+        RedirectionResponse, SessionToken, UrlDetails, VaultDetails, VaultSessionDetails,
+        VerifyRequest, VerifyResponse, VgsSessionDetails, WalletData,
     },
 };
 pub use common_types::payments::{AcceptanceType, CustomerAcceptance, OnlineMandate};
@@ -41,29 +43,29 @@ pub use hyperswitch_domain_models::router_flow_types::payments::{
     Approve, Authorize, AuthorizeSessionToken, Balance, CalculateTax, Capture, CompleteAuthorize,
     CreateConnectorCustomer, CreateOrder, ExtendAuthorization, ExternalVaultProxy, GenerateQr,
     IncrementalAuthorization, InitPayment, PSync, PaymentCreateIntent, PaymentGetIntent,
-    PaymentMethodToken, PaymentUpdateIntent, PostCaptureVoid, PostProcessing, PostSessionTokens,
-    PreProcessing, PushNotification, RecordAttempt, Reject, SdkSessionUpdate, Session,
-    SetupMandate, UpdateMetadata, Void,
+    PaymentMethodToken, PaymentUpdateIntent, PostCaptureVoid, PostCaptureVoidSync, PostProcessing,
+    PostSessionTokens, PreAuthorizeVoid, PreProcessing, PushNotification, RecordAttempt, Reject,
+    SdkSessionUpdate, Session, SetupMandate, UpdateMetadata, UpdatePostConfirm, Void,
 };
 pub use hyperswitch_interfaces::api::payments::{
     ConnectorCustomer, MandateSetup, Payment, PaymentApprove, PaymentAuthorize,
     PaymentAuthorizeSessionToken, PaymentCapture, PaymentIncrementalAuthorization,
-    PaymentPostCaptureVoid, PaymentPostSessionTokens, PaymentReject, PaymentSession,
-    PaymentSessionUpdate, PaymentSync, PaymentToken, PaymentUpdateMetadata, PaymentVoid,
-    PaymentsCompleteAuthorize, PaymentsCreateOrder, PaymentsGenerateQr, PaymentsPostProcessing,
-    PaymentsPreProcessing, PaymentsPushNotification, SurchargeCalculation, SurchargeComplete,
-    SurchargeRefund, TaxCalculation,
+    PaymentPostCaptureVoid, PaymentPostCaptureVoidSync, PaymentPostSessionTokens, PaymentReject,
+    PaymentSession, PaymentSessionUpdate, PaymentSync, PaymentToken, PaymentUpdate,
+    PaymentUpdateMetadata, PaymentVoid, PaymentsCompleteAuthorize, PaymentsCreateOrder,
+    PaymentsGenerateQr, PaymentsPostProcessing, PaymentsPreProcessing, PaymentsPushNotification,
+    SurchargeCalculation, SurchargeComplete, SurchargeRefund, TaxCalculation,
 };
 pub use mandates::MandateTransactionType;
 
 pub use super::payments_v2::{
     ConnectorCustomerV2, MandateSetupV2, PaymentApproveV2, PaymentAuthorizeSessionTokenV2,
     PaymentAuthorizeV2, PaymentCaptureV2, PaymentExtendAuthorizationV2,
-    PaymentIncrementalAuthorizationV2, PaymentPostCaptureVoidV2, PaymentPostSessionTokensV2,
-    PaymentRejectV2, PaymentSessionUpdateV2, PaymentSessionV2, PaymentSyncV2, PaymentTokenV2,
-    PaymentUpdateMetadataV2, PaymentV2, PaymentVoidV2, PaymentsCompleteAuthorizeV2,
-    PaymentsGenerateQrV2, PaymentsPostProcessingV2, PaymentsPreProcessingV2,
-    PaymentsPushNotificationV2, TaxCalculationV2,
+    PaymentIncrementalAuthorizationV2, PaymentPostCaptureVoidSyncV2, PaymentPostCaptureVoidV2,
+    PaymentPostSessionTokensV2, PaymentRejectV2, PaymentSessionUpdateV2, PaymentSessionV2,
+    PaymentSyncV2, PaymentTokenV2, PaymentUpdateMetadataV2, PaymentV2, PaymentVoidV2,
+    PaymentsCompleteAuthorizeV2, PaymentsGenerateQrV2, PaymentsPostProcessingV2,
+    PaymentsPreProcessingV2, PaymentsPushNotificationV2, TaxCalculationV2,
 };
 use crate::core::errors;
 
@@ -89,7 +91,7 @@ impl PaymentIdTypeExt for PaymentIdType {
             Self::ConnectorTransactionId(_)
             | Self::PaymentAttemptId(_)
             | Self::PreprocessingId(_) => Err(errors::ValidationError::IncorrectValueProvided {
-                field_name: "payment_id",
+                field_name: "payment_id".into(),
             })
             .attach_printable("Expected payment intent ID but got connector transaction ID"),
         }
@@ -104,7 +106,7 @@ impl PaymentIdTypeExt for PaymentIdType {
             Self::ConnectorTransactionId(_)
             | Self::PaymentAttemptId(_)
             | Self::PreprocessingId(_) => Err(errors::ValidationError::IncorrectValueProvided {
-                field_name: "payment_id",
+                field_name: "payment_id".into(),
             })
             .attach_printable("Expected payment intent ID but got connector transaction ID"),
         }
@@ -153,6 +155,9 @@ mod payments_test {
             card_issuing_country: None,
             card_issuing_country_code: None,
             card_type: None,
+            card_subtype: None,
+            card_segment_type: None,
+            funding_source: None,
             nick_name: Some(hyperswitch_masking::Secret::new("nick_name".into())),
         }
     }

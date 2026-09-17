@@ -17,8 +17,8 @@ use hyperswitch_domain_models::{
     },
     router_request_types::{
         DisputeSyncData, FetchDisputesRequestData, PaymentsAuthorizeData,
-        PaymentsCancelPostCaptureData, PaymentsSyncData, ResponseId, RetrieveFileRequestData,
-        SetupMandateRequestData, UploadFileRequestData,
+        PaymentsCancelPostCaptureData, PaymentsCancelPostCaptureSyncData, PaymentsSyncData,
+        ResponseId, RetrieveFileRequestData, SetupMandateRequestData, UploadFileRequestData,
     },
     router_response_types::{
         DisputeSyncResponse, FetchDisputesResponse, MandateReference, PaymentsResponseData,
@@ -556,6 +556,56 @@ impl TryFrom<&connector_utils::CardIssuer> for WorldpayvativCardType {
     }
 }
 
+impl<F>
+    TryFrom<
+        ResponseRouterData<
+            F,
+            VantivSyncResponse,
+            PaymentsCancelPostCaptureSyncData,
+            PaymentsResponseData,
+        >,
+    > for RouterData<F, PaymentsCancelPostCaptureSyncData, PaymentsResponseData>
+{
+    type Error = error_stack::Report<errors::ConnectorError>;
+    fn try_from(
+        item: ResponseRouterData<
+            F,
+            VantivSyncResponse,
+            PaymentsCancelPostCaptureSyncData,
+            PaymentsResponseData,
+        >,
+    ) -> Result<Self, Self::Error> {
+        let status = match item.response.payment_status {
+            PaymentStatus::ProcessedSuccessfully => common_enums::PostCaptureVoidStatus::Succeeded,
+            PaymentStatus::TransactionDeclined => common_enums::PostCaptureVoidStatus::Failed,
+            PaymentStatus::PaymentStatusNotFound
+            | PaymentStatus::NotYetProcessed
+            | PaymentStatus::StatusUnavailable => common_enums::PostCaptureVoidStatus::Pending,
+        };
+        let connector_reference_id = item
+            .response
+            .payment_detail
+            .as_ref()
+            .and_then(|detail| detail.payment_id.map(|id| id.to_string()));
+
+        let description = item
+            .response
+            .payment_detail
+            .as_ref()
+            .and_then(|detail| detail.response_reason_message.clone())
+            .filter(|_| connector_utils::is_post_capture_void_failure(status));
+
+        Ok(Self {
+            response: Ok(PaymentsResponseData::PostCaptureVoidResponse {
+                post_capture_void_status: status,
+                connector_reference_id,
+                description,
+            }),
+            ..item.data
+        })
+    }
+}
+
 impl<F> TryFrom<ResponseRouterData<F, VantivSyncResponse, PaymentsSyncData, PaymentsResponseData>>
     for RouterData<F, PaymentsSyncData, PaymentsResponseData>
 {
@@ -638,6 +688,7 @@ impl<F> TryFrom<ResponseRouterData<F, VantivSyncResponse, PaymentsSyncData, Paym
                     incremental_authorization_allowed: None,
                     authentication_data: None,
                     charges: None,
+                    payment_account_reference: None,
                 }),
                 minor_amount_captured,
                 ..item.data
@@ -1582,6 +1633,7 @@ impl TryFrom<PaymentsCaptureResponseRouterData<CnpOnlineResponse>> for PaymentsC
                             incremental_authorization_allowed: None,
                             authentication_data: None,
                             charges: None,
+                            payment_account_reference: None,
                         }),
                         ..item.data
                     })
@@ -1627,13 +1679,9 @@ impl TryFrom<PaymentsCaptureResponseRouterData<CnpOnlineResponse>> for PaymentsC
 }
 
 fn get_vantiv_customer_reference(customer_id: &Option<String>) -> Option<String> {
-    customer_id.clone().and_then(|id| {
-        if id.len() <= worldpayvantiv_constants::CUSTOMER_REFERENCE_MAX_LENGTH {
-            Some(id)
-        } else {
-            None
-        }
-    })
+    customer_id
+        .clone()
+        .filter(|id| id.len() <= worldpayvantiv_constants::CUSTOMER_REFERENCE_MAX_LENGTH)
 }
 
 impl TryFrom<PaymentsCancelResponseRouterData<CnpOnlineResponse>> for PaymentsCancelRouterData {
@@ -1699,6 +1747,7 @@ impl TryFrom<PaymentsCancelResponseRouterData<CnpOnlineResponse>> for PaymentsCa
                             incremental_authorization_allowed: None,
                             authentication_data: None,
                             charges: None,
+                            payment_account_reference: None,
                         }),
                         ..item.data
                     })
@@ -2087,6 +2136,7 @@ impl<F>
                             incremental_authorization_allowed: None,
                             authentication_data: None,
                             charges: None,
+                            payment_account_reference: None,
                         }),
                         connector_response,
                         amount_captured: sale_response.approved_amount.map(MinorUnit::get_amount_as_i64),
@@ -2183,6 +2233,7 @@ impl<F>
                             incremental_authorization_allowed: None,
                             authentication_data: None,
                             charges: None,
+                            payment_account_reference: None,
                         }),
                         connector_response,
                         amount_captured: if payment_flow_type == WorldpayvantivPaymentFlow::Sale {
@@ -2219,7 +2270,7 @@ impl<F>
                 ..item.data
             })},
             (_, _) => {  Err(errors::ConnectorError::UnexpectedResponseError(
-                bytes::Bytes::from("Only one of 'sale_response' or 'authorisation_response' is expected, but both were received".to_string()),           
+                bytes::Bytes::from("Only one of 'sale_response' or 'authorisation_response' is expected, but both were received".to_string()),
              ))?
             },
     }
@@ -2335,6 +2386,7 @@ impl<F>
                             incremental_authorization_allowed: None,
                             authentication_data: None,
                             charges: None,
+                            payment_account_reference: None,
                         }),
                         connector_response,
                         ..item.data
@@ -4622,7 +4674,7 @@ fn get_vantiv_card_data(
                     let exp_date = apple_pay_decrypted_data
                         .get_expiry_date_as_mmyy()
                         .change_context(errors::ConnectorError::InvalidDataFormat {
-                            field_name: "payment_method_data.card.card_exp_month",
+                            field_name: "payment_method_data.card.card_exp_month".into(),
                         })?;
 
                     let cardholder_authentication = CardholderAuthentication {
@@ -4675,7 +4727,7 @@ fn get_vantiv_card_data(
                     let exp_date = google_pay_decrypted_data
                         .get_expiry_date_as_mmyy()
                         .change_context(errors::ConnectorError::InvalidDataFormat {
-                            field_name: "payment_method_data.card.card_exp_month",
+                            field_name: "payment_method_data.card.card_exp_month".into(),
                         })?;
 
                     let cardholder_authentication = CardholderAuthentication {
@@ -4683,7 +4735,7 @@ fn get_vantiv_card_data(
                             .cryptogram
                             .clone()
                             .ok_or_else(|| errors::ConnectorError::MissingRequiredField {
-                                field_name: "cryptogram",
+                                field_name: "cryptogram".into(),
                             })?,
                     };
                     let google_pay_network = google_pay_data

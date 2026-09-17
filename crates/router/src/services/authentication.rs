@@ -201,6 +201,7 @@ pub enum AuthenticationType {
         merchant_id: id_type::MerchantId,
         profile_id: id_type::ProfileId,
     },
+    InternalApiKey,
     NoAuth,
 }
 
@@ -235,11 +236,35 @@ impl AuthenticationType {
             | Self::EmbeddedJwt { merchant_id, .. }
             | Self::SdkAuthorization { merchant_id, .. } => Some(merchant_id),
             Self::AdminApiKey
+            | Self::InternalApiKey
             | Self::OrganizationJwt { .. }
             | Self::BasicAuth { .. }
             | Self::UserJwt { .. }
             | Self::SinglePurposeJwt { .. }
             | Self::SinglePurposeOrLoginJwt { .. }
+            | Self::NoAuth => None,
+        }
+    }
+
+    pub fn get_user_id(&self) -> Option<String> {
+        match self {
+            Self::OrganizationJwt { user_id, .. }
+            | Self::MerchantJwtWithProfileId { user_id, .. }
+            | Self::UserJwt { user_id, .. }
+            | Self::SinglePurposeJwt { user_id, .. }
+            | Self::SinglePurposeOrLoginJwt { user_id, .. } => Some(user_id.clone()),
+            Self::MerchantJwt { user_id, .. } => user_id.clone(),
+            Self::ApiKey { .. }
+            | Self::AdminApiKey
+            | Self::AdminApiAuthWithMerchantId { .. }
+            | Self::BasicAuth { .. }
+            | Self::MerchantId { .. }
+            | Self::PublishableKey { .. }
+            | Self::SdkAuthorization { .. }
+            | Self::WebhookAuth { .. }
+            | Self::InternalMerchantIdProfileId { .. }
+            | Self::EmbeddedJwt { .. }
+            | Self::InternalApiKey
             | Self::NoAuth => None,
         }
     }
@@ -359,7 +384,11 @@ pub struct SinglePurposeOrLoginToken {
     pub tenant_id: Option<id_type::TenantId>,
 }
 
-#[derive(serde::Deserialize)]
+// `Serialize` so the decode boundary can record the claims it reconstructs.
+// The untagged round-trip is unambiguous in this direction: `EmbeddedToken`
+// carries neither `user_id` nor `role_id`, both of which `AuthToken` requires,
+// so an embedded token's JSON cannot deserialize as an `AuthToken`.
+#[derive(serde::Serialize, serde::Deserialize)]
 #[serde(untagged)]
 pub enum AuthOrEmbeddedClaims {
     AuthToken(AuthToken),
@@ -740,7 +769,7 @@ where
                 .map(id_type::ProfileId::from_str)
                 .transpose()
                 .change_context(errors::ValidationError::IncorrectValueProvided {
-                    field_name: "X-Profile-Id",
+                    field_name: "X-Profile-Id".into(),
                 })
                 .change_context(errors::ApiErrorResponse::Unauthorized)?;
 
@@ -832,6 +861,37 @@ impl GetAuthType for ApiKeyAuthWithMerchantIdFromRoute {
 }
 
 #[cfg(feature = "v1")]
+/// Shared API-key authentication for profile and connector CRUD operations keyed off a
+/// merchant id from the route. `allow_platform_self_operation` controls whether a platform
+/// merchant may perform the operation on its own resources (e.g. configuring external vault).
+async fn api_key_auth_with_merchant_id_from_route<A>(
+    merchant_id_from_route: &id_type::MerchantId,
+    allow_platform_self_operation: bool,
+    request_headers: &HeaderMap,
+    state: &A,
+) -> RouterResult<(AuthenticationData, AuthenticationType)>
+where
+    A: SessionStateInfo + Sync,
+{
+    let api_auth = ApiKeyAuth {
+        allow_connected_scope_operation: true,
+        allow_platform_self_operation,
+    };
+    let (auth_data, auth_type): (AuthenticationData, AuthenticationType) = api_auth
+        .authenticate_and_fetch(request_headers, state)
+        .await?;
+
+    let processor_merchant_id = auth_data.platform.get_processor().get_account().get_id();
+
+    fp_utils::when(merchant_id_from_route != processor_merchant_id, || {
+        Err(report!(errors::ApiErrorResponse::Unauthorized))
+            .attach_printable("Merchant ID from route and Processor Merchant Id do not match")
+    })?;
+
+    Ok((auth_data, auth_type))
+}
+
+#[cfg(feature = "v1")]
 #[async_trait]
 impl<A> AuthenticateAndFetch<AuthenticationData, A> for ApiKeyAuthWithMerchantIdFromRoute
 where
@@ -842,24 +902,35 @@ where
         request_headers: &HeaderMap,
         state: &A,
     ) -> RouterResult<(AuthenticationData, AuthenticationType)> {
-        // This is currently used for profile and connector CRUD operations
-        let api_auth = ApiKeyAuth {
-            allow_connected_scope_operation: true,
-            allow_platform_self_operation: false,
-        };
-        let (auth_data, auth_type): (AuthenticationData, AuthenticationType) = api_auth
-            .authenticate_and_fetch(request_headers, state)
-            .await?;
+        api_key_auth_with_merchant_id_from_route(&self.0, false, request_headers, state).await
+    }
+}
 
-        let merchant_id_from_route = self.0.clone();
-        let processor_merchant_id = auth_data.platform.get_processor().get_account().get_id();
+/// Same as [`ApiKeyAuthWithMerchantIdFromRoute`] but also permits a platform merchant to
+/// operate on its own resources. Used by endpoints the platform merchant needs to configure
+/// and manage its external vault (connector create/retrieve/update/list, profile update).
+pub struct ApiKeyAuthWithMerchantIdFromRouteAllowPlatform(pub id_type::MerchantId);
 
-        if merchant_id_from_route != *processor_merchant_id {
-            return Err(report!(errors::ApiErrorResponse::Unauthorized))
-                .attach_printable("Merchant ID from route and Processor Merchant Id do not match");
-        }
+#[cfg(feature = "partial-auth")]
+impl GetAuthType for ApiKeyAuthWithMerchantIdFromRouteAllowPlatform {
+    fn get_auth_type(&self) -> detached::PayloadType {
+        detached::PayloadType::ApiKey
+    }
+}
 
-        Ok((auth_data, auth_type))
+#[cfg(feature = "v1")]
+#[async_trait]
+impl<A> AuthenticateAndFetch<AuthenticationData, A>
+    for ApiKeyAuthWithMerchantIdFromRouteAllowPlatform
+where
+    A: SessionStateInfo + Sync,
+{
+    async fn authenticate_and_fetch(
+        &self,
+        request_headers: &HeaderMap,
+        state: &A,
+    ) -> RouterResult<(AuthenticationData, AuthenticationType)> {
+        api_key_auth_with_merchant_id_from_route(&self.0, true, request_headers, state).await
     }
 }
 
@@ -1263,7 +1334,7 @@ where
         let profile_id = HeaderMapStruct::new(request_headers)
             .get_id_type_from_header_if_present::<id_type::ProfileId>(headers::X_PROFILE_ID)
             .change_context(errors::ValidationError::IncorrectValueProvided {
-                field_name: "X-Profile-Id",
+                field_name: "X-Profile-Id".into(),
             })
             .change_context(errors::ApiErrorResponse::Unauthorized)?;
 
@@ -2146,7 +2217,7 @@ impl<'a> HeaderMapStruct<'a> {
             .attach_printable(format!("Failed to find header key: {key}"))?
             .to_str()
             .change_context(errors::ApiErrorResponse::InvalidDataValue {
-                field_name: "`{key}` in headers",
+                field_name: "`{key}` in headers".into(),
             })
             .attach_printable(format!(
                 "Failed to convert header value to string for header key: {key}",
@@ -2197,7 +2268,7 @@ impl<'a> HeaderMapStruct<'a> {
             .get_required_value(headers::AUTHORIZATION)?
             .to_str()
             .change_context(errors::ApiErrorResponse::InvalidDataValue {
-                field_name: headers::AUTHORIZATION,
+                field_name: headers::AUTHORIZATION.into(),
             })
             .attach_printable("Failed to convert authorization header to string")
     }
@@ -2214,7 +2285,7 @@ impl<'a> HeaderMapStruct<'a> {
             .map(|value| value.to_str())
             .transpose()
             .change_context(errors::ApiErrorResponse::InvalidDataValue {
-                field_name: "`{key}` in headers",
+                field_name: "`{key}` in headers".into(),
             })
             .attach_printable(format!(
                 "Failed to convert header value to string for header key: {key}",
@@ -2718,6 +2789,47 @@ where
                     profile_id: Some(validated_data.profile.get_id().clone()),
                 },
             )),
+            None => self.0.authenticate_and_fetch(request_headers, state).await,
+        }
+    }
+}
+
+pub struct InternalApiKeyAuth<F>(pub F);
+
+#[async_trait]
+impl<A, F> AuthenticateAndFetch<(), A> for InternalApiKeyAuth<F>
+where
+    A: SessionStateInfo + Sync + Send,
+    F: AuthenticateAndFetch<(), A> + Sync + Send,
+{
+    async fn authenticate_and_fetch(
+        &self,
+        request_headers: &HeaderMap,
+        state: &A,
+    ) -> RouterResult<((), AuthenticationType)> {
+        if !state.conf().internal_merchant_id_profile_id_auth.enabled {
+            return self.0.authenticate_and_fetch(request_headers, state).await;
+        }
+
+        let internal_api_key = HeaderMapStruct::new(request_headers)
+            .get_header_value_by_key(headers::X_INTERNAL_API_KEY)
+            .map(|s| s.to_string());
+
+        match internal_api_key {
+            Some(key) => {
+                if key
+                    == *state
+                        .conf()
+                        .internal_merchant_id_profile_id_auth
+                        .internal_api_key
+                        .peek()
+                {
+                    Ok(((), AuthenticationType::InternalApiKey))
+                } else {
+                    Err(errors::ApiErrorResponse::Unauthorized)
+                        .attach_printable("Internal API key authentication failed")
+                }
+            }
             None => self.0.authenticate_and_fetch(request_headers, state).await,
         }
     }
@@ -4892,7 +5004,7 @@ where
 
 pub async fn parse_jwt_payload<A, T>(headers: &HeaderMap, state: &A) -> RouterResult<T>
 where
-    T: serde::de::DeserializeOwned,
+    T: Serialize + serde::de::DeserializeOwned,
     A: SessionStateInfo + Sync,
 {
     let cookie_token_result =
@@ -5094,6 +5206,34 @@ where
 
 pub type AuthenticationDataWithUserId = (AuthenticationData, Option<String>);
 
+/// Auth data paired with the dashboard user behind the request. Unlike
+/// `AuthenticationDataWithUserId`, it carries the whole token identity — a user holds different
+/// roles in different lineages, so the role backing *this* session has to be resolvable.
+#[cfg(feature = "v1")]
+pub type AuthenticationDataWithUser = (AuthenticationData, UserFromToken);
+
+#[cfg(feature = "v1")]
+#[async_trait]
+impl<A> AuthenticateAndFetch<AuthenticationDataWithUser, A> for JWTAuth
+where
+    A: SessionStateInfo + Sync,
+{
+    async fn authenticate_and_fetch(
+        &self,
+        request_headers: &HeaderMap,
+        state: &A,
+    ) -> RouterResult<(AuthenticationDataWithUser, AuthenticationType)> {
+        // Both halves are delegated rather than reimplemented, so the permission and tenant checks
+        // stay in one place and this cannot drift from them.
+        let (auth_data, auth_type): (AuthenticationData, AuthenticationType) =
+            self.authenticate_and_fetch(request_headers, state).await?;
+        let (user, _): (UserFromToken, AuthenticationType) =
+            self.authenticate_and_fetch(request_headers, state).await?;
+
+        Ok(((auth_data, user), auth_type))
+    }
+}
+
 #[cfg(feature = "v1")]
 #[async_trait]
 impl<A> AuthenticateAndFetch<AuthenticationDataWithUserId, A> for JWTAuth
@@ -5171,7 +5311,7 @@ where
             (auth.clone(), Some(payload.user_id.clone())),
             AuthenticationType::MerchantJwt {
                 merchant_id: payload.merchant_id,
-                user_id: None,
+                user_id: Some(payload.user_id),
             },
         ))
     }
@@ -5556,6 +5696,15 @@ impl ClientSecretFetch for payments::PaymentsRequest {
 }
 
 #[cfg(feature = "v1")]
+impl ClientSecretFetch for payments::PaymentsEligibilityCheckRequest {
+    fn get_client_secret(&self) -> Option<&String> {
+        self.client_secret
+            .as_ref()
+            .map(|client_secret| client_secret.peek())
+    }
+}
+
+#[cfg(feature = "v1")]
 impl ClientSecretFetch for payments::PaymentsEligibilityRequest {
     fn get_client_secret(&self) -> Option<&String> {
         self.client_secret
@@ -5703,6 +5852,14 @@ impl ClientSecretFetch for api_models::authentication::AuthenticationSessionToke
     }
 }
 
+impl ClientSecretFetch for api_models::superposition_sdk_config::SdkConfigRequest {
+    fn get_client_secret(&self) -> Option<&String> {
+        self.client_secret
+            .as_ref()
+            .map(|client_secret| client_secret.peek())
+    }
+}
+
 pub fn get_auth_type_and_flow<A: SessionStateInfo + Sync + Send>(
     headers: &HeaderMap,
     api_auth: ApiKeyAuth,
@@ -5766,7 +5923,7 @@ where
             .get_client_secret()
             .check_value_present("client_secret")
             .map_err(|_| errors::ApiErrorResponse::MissingRequiredField {
-                field_name: "client_secret",
+                field_name: "client_secret".into(),
             })?;
         return Ok((
             Box::new(HeaderAuth(PublishableKeyAuth {
@@ -5815,6 +5972,54 @@ where
         None => {
             // Use existing client_secret and publishable key check
             check_client_secret_and_get_auth(headers, payload, api_auth)
+        }
+    }
+}
+
+/// Checks SDK authorization first, then falls back to publishable-key auth with
+/// a required client secret. Merchant secret-key auth is intentionally rejected.
+#[cfg(feature = "v1")]
+pub fn check_sdk_auth_or_client_secret_auth<T>(
+    headers: &HeaderMap,
+    payload: &impl ClientSecretFetch,
+    api_auth: ApiKeyAuth,
+) -> RouterResult<(
+    Box<dyn AuthenticateAndFetch<AuthenticationData, T>>,
+    api::AuthFlow,
+)>
+where
+    T: SessionStateInfo + Sync + Send,
+    PublishableKeyAuth: AuthenticateAndFetch<AuthenticationData, T>,
+    SdkAuthorizationAuth: AuthenticateAndFetch<AuthenticationData, T>,
+{
+    match get_header_value_by_key(headers::AUTHORIZATION.into(), headers)? {
+        Some(_) => Ok((
+            Box::new(SdkAuthorizationAuth {
+                allow_connected_scope_operation: api_auth.allow_connected_scope_operation,
+                allow_platform_self_operation: api_auth.allow_platform_self_operation,
+            }),
+            api::AuthFlow::Client,
+        )),
+        None => {
+            let api_key = get_api_key(headers)?;
+
+            match (
+                api_key.starts_with("pk_"),
+                payload.get_client_secret().is_some(),
+            ) {
+                (true, true) => Ok((
+                    Box::new(HeaderAuth(PublishableKeyAuth {
+                        allow_connected_scope_operation: api_auth.allow_connected_scope_operation,
+                        allow_platform_self_operation: api_auth.allow_platform_self_operation,
+                    })),
+                    api::AuthFlow::Client,
+                )),
+                (true, false) => Err(errors::ApiErrorResponse::MissingRequiredField {
+                    field_name: "client_secret".into(),
+                }
+                .into()),
+                (false, _) => Err(errors::ApiErrorResponse::Unauthorized.into()),
+            }
         }
     }
 }
@@ -6004,23 +6209,107 @@ where
     }
 }
 
-pub async fn decode_jwt<T>(token: &str, state: &impl SessionStateInfo) -> RouterResult<T>
-where
-    T: serde::de::DeserializeOwned,
-{
-    let conf = state.conf();
-    let secret = conf.secrets.get_inner().jwt_secret.peek().as_bytes();
+/// The decision `jsonwebtoken` reaches about a token, as something that can be
+/// recorded.
+///
+/// [`errors::ApiErrorResponse`] cannot be: it derives neither `Serialize` nor
+/// `Deserialize`, and it carries a hundred variants that have nothing to do with
+/// this call. `decode_jwt` collapses every `jsonwebtoken` failure into two of
+/// them anyway, so these are those two and nothing else crosses the boundary.
+/// The mapping back to the public error type stays in `decode_jwt`, unchanged.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, thiserror::Error,
+)]
+pub enum JwtDecodeOutcome {
+    /// The token parsed and verified, but `exp` had passed.
+    #[error("expired JWT token")]
+    Expired,
+    /// Anything else: malformed, wrong algorithm, bad signature, absent claims.
+    #[error("invalid JWT token")]
+    Invalid,
+}
 
+/// Names a token to the recorder without putting the token in the tape.
+///
+/// A recording lives in object storage for weeks and is read by anyone who can
+/// read the bucket; a dashboard JWT stays valid for two days
+/// (`consts::JWT_TOKEN_TIME_IN_SECS`). The digest is enough to pair a replayed
+/// call with its recorded outcome and cannot be presented as a credential.
+#[cfg(feature = "deja")]
+fn token_digest(token: &str) -> String {
+    blake3::hash(token.as_bytes()).to_hex().to_string()
+}
+
+/// Verifies `token` and returns its claims, or which of the two failures it hit.
+///
+/// This is a boundary because the clock that decides the answer is not one deja
+/// can reach. `Validation::new` defaults `validate_exp` to true and
+/// `jsonwebtoken` reads `SystemTime::now()` itself, so the instrumented
+/// `date_time::now` boundary never sees it — the same bypass already recorded
+/// on the issuing side in `services::jwt::generate_exp`. API-key expiry has no
+/// such problem: it compares against `date_time::now()` and so already replays
+/// deterministically. Recording the decode outcome takes the clock out of the
+/// replay path entirely, rather than trying to hold it still.
+///
+/// The seam is deliberately this narrow. Recording the whole authentication
+/// result instead would also swallow the merchant-key-store, merchant-account,
+/// business-profile and decrypt calls that follow it, which are exactly the
+/// calls a replay exists to compare.
+///
+/// A token absent from the recording does not decode silently: the substitute
+/// misses and the boundary fail-stops, the same as any other missed substitute.
+///
+/// `pub` only so the boundary can be exercised from an integration test:
+/// `set_global_runtime_hook` is a one-shot `OnceLock`, so record and replay
+/// each need their own test binary, and a test binary cannot reach a private
+/// item. Callers should use [`decode_jwt`].
+#[doc(hidden)]
+#[cfg_attr(
+    feature = "deja",
+    deja::time(
+        component = "router::authentication",
+        operation = "decode_jwt",
+        codec = deja::codec::ResultCodec::<T, JwtDecodeOutcome>,
+        args = {
+            serde_json::json!({
+                "token_digest": token_digest(token),
+                // Two call sites may present the same token for different
+                // claims, and their recorded shapes differ. Identity says which.
+                "claims_type": std::any::type_name::<T>(),
+            })
+        },
+    )
+)]
+pub fn decode_jwt_verified<T>(
+    token: &str,
+    secret: &[u8],
+) -> common_utils::errors::CustomResult<T, JwtDecodeOutcome>
+where
+    T: Serialize + serde::de::DeserializeOwned,
+{
     let key = DecodingKey::from_secret(secret);
     decode::<T>(token, &key, &Validation::new(Algorithm::HS256))
         .map(|decoded| decoded.claims)
         .map_err(|e| {
             if e.kind() == &ExpiredSignature {
-                report!(errors::ApiErrorResponse::ExpiredJwtToken)
+                report!(JwtDecodeOutcome::Expired)
             } else {
-                report!(errors::ApiErrorResponse::InvalidJwtToken)
+                report!(JwtDecodeOutcome::Invalid)
             }
         })
+}
+
+pub async fn decode_jwt<T>(token: &str, state: &impl SessionStateInfo) -> RouterResult<T>
+where
+    T: Serialize + serde::de::DeserializeOwned,
+{
+    let conf = state.conf();
+    let secret = conf.secrets.get_inner().jwt_secret.peek().as_bytes();
+
+    decode_jwt_verified::<T>(token, secret).map_err(|report| match report.current_context() {
+        JwtDecodeOutcome::Expired => report!(errors::ApiErrorResponse::ExpiredJwtToken),
+        JwtDecodeOutcome::Invalid => report!(errors::ApiErrorResponse::InvalidJwtToken),
+    })
 }
 
 pub fn get_api_key(headers: &HeaderMap) -> RouterResult<&str> {

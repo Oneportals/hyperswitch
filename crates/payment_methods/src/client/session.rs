@@ -41,10 +41,7 @@ pub struct VgsSessionDetailsResponse {
 /// Local deserializable mirror of `api_models::payments::HyperswitchVaultSessionDetails`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct HyperswitchVaultSessionDetailsResponse {
-    pub payment_method_session_id: Secret<String>,
-    pub client_secret: Secret<String>,
-    pub publishable_key: Secret<String>,
-    pub profile_id: Secret<String>,
+    pub sdk_authorization: Secret<String>,
 }
 
 /// Local deserializable mirror of `api_models::payments::VaultSessionDetails`.
@@ -66,10 +63,7 @@ impl From<VaultSessionDetailsResponse> for api_models::payments::VaultSessionDet
             }
             VaultSessionDetailsResponse::HyperswitchVault(hsv) => {
                 Self::HyperswitchVault(api_models::payments::HyperswitchVaultSessionDetails {
-                    payment_method_session_id: hsv.payment_method_session_id,
-                    client_secret: hsv.client_secret,
-                    publishable_key: hsv.publishable_key,
-                    profile_id: hsv.profile_id,
+                    sdk_authorization: hsv.sdk_authorization,
                 })
             }
         }
@@ -90,6 +84,9 @@ pub struct ModularPMSessionCreateResponse {
     /// External vault session details returned by the PM service when an external vault is
     /// configured for the profile.
     pub external_vault_details: Option<VaultSessionDetailsResponse>,
+    /// When the session stops being usable on the PM service side.
+    #[serde(default, with = "common_utils::custom_serde::iso8601::option")]
+    pub expires_at: Option<time::PrimitiveDateTime>,
 }
 
 /// V1-facing response (thin wrapper around the wire response).
@@ -100,6 +97,7 @@ pub struct CreatePaymentMethodSessionResponse {
     pub customer_id: Option<id_type::CustomerId>,
     pub sdk_authorization: Option<String>,
     pub external_vault_details: Option<api_models::payments::VaultSessionDetails>,
+    pub expires_at: Option<time::PrimitiveDateTime>,
 }
 
 // --- Conversions ---
@@ -125,6 +123,7 @@ impl TryFrom<ModularPMSessionCreateResponse> for CreatePaymentMethodSessionRespo
             customer_id: resp.customer_id,
             sdk_authorization: resp.sdk_authorization,
             external_vault_details: resp.external_vault_details.map(Into::into),
+            expires_at: resp.expires_at,
         })
     }
 }

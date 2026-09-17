@@ -1,10 +1,10 @@
 import {
+  blockedPaymentErrorBodyForBinUnavailable,
+  blockedPaymentErrorBodyForCardSubtype,
+  blockedPaymentErrorBodyForDebitCard,
+  blockedPaymentErrorBodyForIssuingCountry,
   cardRequiredField,
   customerAcceptance,
-  blockedPaymentErrorBodyForIssuingCountry,
-  blockedPaymentErrorBodyForDebitCard,
-  blockedPaymentErrorBodyForCardSubtype,
-  blockedPaymentErrorBodyForBinUnavailable,
 } from "./Commons";
 
 const successfulNo3DSCardDetails = {
@@ -85,9 +85,21 @@ const requiredFields = {
   ],
 };
 
+const MITErrorResponse = {
+  status: 200,
+  body: {
+    status: "failed",
+    error_code: "Token not found",
+    error_message: "Token not found",
+  },
+};
+
 export const connectorDetails = {
   real_time_payment_pm: {
     DuitNow: {
+      Configs: {
+        TRIGGER_SKIP: true, //Since fiuu follows a qr flow we are skipping the qr handling
+      },
       Request: {
         payment_method: "real_time_payment",
         payment_method_type: "duit_now",
@@ -327,6 +339,7 @@ export const connectorDetails = {
     },
     MandateSingleUseNo3DSAutoCapture: {
       Request: {
+        amount: 6000,
         payment_method: "card",
         payment_method_data: {
           card: successfulNo3DSCardDetails,
@@ -344,6 +357,7 @@ export const connectorDetails = {
     },
     MandateSingleUseNo3DSManualCapture: {
       Request: {
+        amount: 6000,
         payment_method: "card",
         payment_method_data: {
           card: successfulNo3DSCardDetails,
@@ -361,6 +375,7 @@ export const connectorDetails = {
     },
     MandateMultiUseNo3DSAutoCapture: {
       Request: {
+        amount: 6000,
         payment_method: "card",
         payment_method_data: {
           card: successfulNo3DSCardDetails,
@@ -378,6 +393,7 @@ export const connectorDetails = {
     },
     MandateMultiUseNo3DSManualCapture: {
       Request: {
+        amount: 6000,
         payment_method: "card",
         payment_method_data: {
           card: successfulNo3DSCardDetails,
@@ -432,22 +448,44 @@ export const connectorDetails = {
         TRIGGER_SKIP: true,
       },
       Request: {
+        amount: 6000,
         currency: "MYR",
         billing: billingAddress,
+      },
+      Response: MITErrorResponse,
+    },
+    MITAutoCaptureWithCustomerAcceptance: {
+      Configs: {
+        TRIGGER_SKIP: true,
+      },
+      Request: {
+        amount: 6000,
+        currency: "MYR",
+        billing: billingAddress,
+        customer_acceptance: {
+          acceptance_type: "offline",
+          accepted_at: "1963-05-03T04:07:52.723Z",
+          online: {
+            ip_address: "127.0.0.1",
+            user_agent: "amet irure esse",
+          },
+        },
       },
       Response: {
         status: 200,
         body: {
           status: "failed",
-          error_code:
-            "Your transaction has been denied due to merchant account issue",
-          error_message:
-            "Your transaction has been denied due to merchant account issue",
+          error_code: "Token not found",
+          error_message: "Token not found",
         },
       },
     },
     MITWithoutBillingAddress: {
+      Configs: {
+        TRIGGER_SKIP: true,
+      },
       Request: {
+        amount: 6000,
         billing: null,
       },
       Response: {
@@ -460,17 +498,15 @@ export const connectorDetails = {
       },
     },
     MITManualCapture: {
-      Request: {},
-      Response: {
-        status: 200,
-        body: {
-          status: "failed",
-          error_code:
-            "Your transaction has been denied due to merchant account issue",
-          error_message:
-            "Your transaction has been denied due to merchant account issue",
-        },
+      Configs: {
+        TRIGGER_SKIP: true,
       },
+      Request: {
+        amount: 6000,
+        currency: "MYR",
+        billing: billingAddress,
+      },
+      Response: MITErrorResponse,
     },
     PaymentIntentOffSession: {
       Request: {
@@ -490,6 +526,7 @@ export const connectorDetails = {
     },
     PaymentMethodIdMandateNo3DSAutoCapture: {
       Request: {
+        amount: 6000,
         payment_method: "card",
         payment_method_data: {
           card: successfulNo3DSCardDetails,
@@ -603,35 +640,18 @@ export const connectorDetails = {
         setup_future_usage: "off_session",
         billing: billingAddress,
       },
-      Response: {
-        status: 200,
-        body: {
-          status: "failed",
-          error_code:
-            "Your transaction has been denied due to merchant account issue",
-          error_message:
-            "Your transaction has been denied due to merchant account issue",
-        },
-      },
+      Response: MITErrorResponse,
     },
     SaveCardConfirmManualCaptureOffSession: {
       Request: {
         setup_future_usage: "off_session",
         billing: billingAddress,
       },
-      Response: {
-        status: 200,
-        body: {
-          status: "failed",
-          error_code:
-            "Your transaction has been denied due to merchant account issue",
-          error_message:
-            "Your transaction has been denied due to merchant account issue",
-        },
-      },
+      Response: MITErrorResponse,
     },
     PaymentMethodIdMandateNo3DSManualCapture: {
       Request: {
+        amount: 6000,
         payment_method: "card",
         payment_method_data: {
           card: successfulNo3DSCardDetails,
@@ -651,6 +671,7 @@ export const connectorDetails = {
     },
     PaymentMethodIdMandate3DSAutoCapture: {
       Request: {
+        amount: 6000,
         payment_method: "card",
         payment_method_data: {
           card: successfulThreeDSTestCardDetails,
@@ -671,6 +692,7 @@ export const connectorDetails = {
     },
     PaymentMethodIdMandate3DSManualCapture: {
       Request: {
+        amount: 6000,
         payment_method: "card",
         payment_method_data: {
           card: successfulThreeDSTestCardDetails,
@@ -715,6 +737,7 @@ export const connectorDetails = {
         TRIGGER_SKIP: true,
       },
       Request: {
+        amount: 0,
         payment_method: "card",
         payment_method_data: {
           card: successfulNo3DSCardDetails,
@@ -735,16 +758,7 @@ export const connectorDetails = {
         setup_future_usage: "off_session",
         billing: null,
       },
-      Response: {
-        status: 200,
-        body: {
-          status: "failed",
-          error_code:
-            "Your transaction has been denied due to merchant account issue",
-          error_message:
-            "Your transaction has been denied due to merchant account issue",
-        },
-      },
+      Response: MITErrorResponse,
     },
     ZeroAuthPaymentIntent: {
       Configs: {
@@ -765,6 +779,7 @@ export const connectorDetails = {
     },
     ZeroAuthConfirmPayment: {
       Request: {
+        amount: 0,
         payment_type: "setup_mandate",
         payment_method: "card",
         payment_method_type: "credit",

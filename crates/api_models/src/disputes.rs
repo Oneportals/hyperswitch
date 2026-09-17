@@ -1,14 +1,17 @@
 use std::collections::HashMap;
 
-use common_utils::types::{StringMinorUnit, TimeRange};
-use hyperswitch_masking::{Deserialize, Serialize};
+use common_utils::{
+    pii::EmailStrategy,
+    types::{StringMinorUnit, TimeRange},
+};
+use hyperswitch_masking::{Deserialize, Secret, Serialize};
 use serde::de::Error;
 use smithy::SmithyModel;
 use time::PrimitiveDateTime;
 use utoipa::ToSchema;
 
 use super::enums::{Currency, DisputeStage, DisputeStatus};
-use crate::{admin::MerchantConnectorInfo, files};
+use crate::{admin::MerchantConnectorInfo, files::FileMetadataResponse};
 
 #[derive(Clone, Debug, Serialize, ToSchema)]
 pub struct DisputeResponse {
@@ -105,7 +108,7 @@ pub struct DisputeResponsePaymentsRetrieve {
     pub created_at: PrimitiveDateTime,
 }
 
-#[derive(Debug, Serialize, Deserialize, strum::Display, Clone)]
+#[derive(Debug, Serialize, Deserialize, strum::Display, Clone, ToSchema)]
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
 pub enum EvidenceType {
@@ -126,7 +129,7 @@ pub struct DisputeEvidenceBlock {
     /// Evidence type
     pub evidence_type: EvidenceType,
     /// File metadata
-    pub file_metadata_response: files::FileMetadataResponse,
+    pub file_metadata_response: FileMetadataResponse,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
@@ -137,9 +140,11 @@ pub struct DisputeListGetConstraints {
     /// The payment_id against which dispute is raised
     pub payment_id: Option<common_utils::id_type::PaymentId>,
     /// Limit on the number of objects to return
-    pub limit: Option<u32>,
+    #[serde(default)]
+    pub limit: common_utils::types::list::PageSize,
     /// The starting point within a list of object
-    pub offset: Option<u32>,
+    #[serde(default)]
+    pub offset: common_utils::types::list::PageOffset,
     /// The identifier for business profile
     #[schema(value_type = Option<String>)]
     pub profile_id: Option<common_utils::id_type::ProfileId>,
@@ -193,7 +198,8 @@ pub struct SubmitEvidenceRequest {
     /// File Id of customer communication
     pub customer_communication: Option<String>,
     /// Customer email address
-    pub customer_email_address: Option<String>,
+    #[schema(value_type = Option<String>)]
+    pub customer_email_address: Option<Secret<String, EmailStrategy>>,
     /// Customer name
     pub customer_name: Option<String>,
     /// IP address of the customer
@@ -250,7 +256,7 @@ pub struct DisputeRetrieveRequest {
     pub force_sync: Option<bool>,
 }
 
-#[derive(Clone, Debug, serde::Serialize)]
+#[derive(Clone, Debug, serde::Serialize, ToSchema)]
 pub struct DisputesAggregateResponse {
     /// Different status of disputes with their count
     pub status_with_count: HashMap<DisputeStatus, i64>,

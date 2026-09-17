@@ -41,9 +41,11 @@ impl<F: Send + Clone + Sync> GetTracker<F, PaymentData<F>, PaymentsCancelRequest
         _request: &PaymentsCancelRequest,
         platform: &domain::Platform,
         _auth_flow: services::AuthFlow,
+        _flow_kind: operations::PaymentFlowKind,
         _header_payload: &hyperswitch_domain_models::payments::HeaderPayload,
         _payment_method_fetch_data: operations::PaymentMethodFetchData,
         _dimensions: &dimension_state::DimensionsWithProcessorAndProviderMerchantId,
+        _payment_pre_fetched_info: Option<operations::PaymentPreFetchedInformation>,
     ) -> RouterResult<operations::GetTrackerResponse<'a, F, PaymentsCancelRequest, PaymentData<F>>>
     {
         let db = &*state.store;
@@ -206,6 +208,8 @@ impl<F: Send + Clone + Sync> GetTracker<F, PaymentData<F>, PaymentsCancelRequest
             external_authentication_data: None,
             client_session_id: None,
             vault_session_details: None,
+            external_vault_pmd: None,
+            update_request_fields: None,
         };
 
         let get_trackers_response = operations::GetTrackerResponse {
@@ -251,7 +255,15 @@ impl<F: Clone + Sync> UpdateTracker<F, PaymentData<F>, PaymentsCancelRequest> fo
                 .map_or((None, None), |fraud_check| {
                     (
                         Some(Some(fraud_check.frm_status.to_string())),
-                        Some(fraud_check.frm_reason.map(|reason| reason.to_string())),
+                        Some(
+                            fraud_check
+                                .frm_reason
+                                .map(|reason| match reason {
+                                    serde_json::Value::String(s) => s,
+                                    other => other.to_string(),
+                                })
+                                .or(fraud_check.frm_error),
+                        ),
                     )
                 });
         let attempt_status_update = storage::PaymentAttemptUpdate::RejectUpdate {
