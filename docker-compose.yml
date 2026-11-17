@@ -125,8 +125,6 @@ services:
     image: docker.juspay.io/juspaydotin/hyperswitch-router:standalone
     pull_policy: always
     command: /local/bin/router -f /local/config/docker_compose.toml
-    ports:
-      - "8080:8080"
     networks:
       - router_net
     volumes:
