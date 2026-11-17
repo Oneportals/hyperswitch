@@ -1,7 +1,9 @@
 use common_utils::ext_traits::{ByteSliceExt, Encode};
 use error_stack::ResultExt;
-pub use hyperswitch_domain_models::merchant_connector_account::MerchantConnectorAccountInterface;
-use router_env::{instrument, tracing};
+pub use hyperswitch_domain_models::merchant_connector_account::{
+    MerchantConnectorAccountInterface, TrackedMerchantConnectorAccountInterface,
+};
+use router_env::instrument;
 use storage_impl::redis::kv_store::RedisConnInterface;
 
 use super::{MockDb, Store};
@@ -101,10 +103,13 @@ mod merchant_connector_account_cache_tests {
     use error_stack::ResultExt;
     use hyperswitch_domain_models::master_key::MasterKeyInterface;
     use hyperswitch_masking::PeekInterface;
-    use storage_impl::redis::{
-        cache::{self, CacheKey, CacheKind, ACCOUNTS_CACHE},
-        kv_store::RedisConnInterface,
-        pub_sub::PubSubInterface,
+    use storage_impl::{
+        behaviour::Conversion,
+        redis::{
+            cache::{self, CacheInterface, CacheKey, CacheKind},
+            kv_store::RedisConnInterface,
+            pub_sub::PubSubInterface,
+        },
     };
     use time::macros::datetime;
     use tokio::sync::oneshot;
@@ -121,7 +126,7 @@ mod merchant_connector_account_cache_tests {
         },
         services,
         types::{
-            domain::{self, behaviour::Conversion},
+            domain::{self},
             storage,
         },
     };
@@ -158,7 +163,7 @@ mod merchant_connector_account_cache_tests {
         let redis_conn = db.get_redis_conn().unwrap();
         let master_key = db.get_master_key();
         redis_conn
-            .subscribe("hyperswitch_invalidate")
+            .subscribe(&db.caches().invalidation_channel, Arc::clone(&db.caches))
             .await
             .unwrap();
 
@@ -269,18 +274,19 @@ mod merchant_connector_account_cache_tests {
             .await
             .change_context(errors::StorageError::DecryptionError)
         };
-        let _: storage::MerchantConnectorAccount = cache::get_or_populate_in_memory(
-            &db,
-            &format!(
-                "{}_{}",
-                merchant_id.get_string_repr(),
-                profile_id.get_string_repr(),
-            ),
-            find_call,
-            &ACCOUNTS_CACHE,
-        )
-        .await
-        .unwrap();
+        let _: storage::MerchantConnectorAccount =
+            Box::pin(cache::get_or_populate_in_memory_redis(
+                &db,
+                &format!(
+                    "{}_{}",
+                    merchant_id.get_string_repr(),
+                    profile_id.get_string_repr(),
+                ),
+                find_call(),
+                cache::CacheId::Accounts,
+            ))
+            .await
+            .unwrap();
 
         let delete_call = || async {
             db.delete_merchant_connector_account_by_merchant_id_merchant_connector_id(
@@ -303,7 +309,9 @@ mod merchant_connector_account_cache_tests {
         .await
         .unwrap();
 
-        assert!(ACCOUNTS_CACHE
+        assert!(db
+            .caches()
+            .accounts
             .get_val::<domain::MerchantConnectorAccount>(CacheKey {
                 key: format!("{}_{}", merchant_id.get_string_repr(), connector_label),
                 prefix: String::default(),
@@ -343,7 +351,7 @@ mod merchant_connector_account_cache_tests {
         let redis_conn = db.get_redis_conn().unwrap();
         let master_key = db.get_master_key();
         redis_conn
-            .subscribe("hyperswitch_invalidate")
+            .subscribe(&db.caches().invalidation_channel, Arc::clone(&db.caches))
             .await
             .unwrap();
 
@@ -448,18 +456,19 @@ mod merchant_connector_account_cache_tests {
                 .change_context(errors::StorageError::DecryptionError)
         };
 
-        let _: storage::MerchantConnectorAccount = cache::get_or_populate_in_memory(
-            &db,
-            &format!(
-                "{}_{}",
-                merchant_id.clone().get_string_repr(),
-                profile_id.get_string_repr()
-            ),
-            find_call,
-            &ACCOUNTS_CACHE,
-        )
-        .await
-        .unwrap();
+        let _: storage::MerchantConnectorAccount =
+            Box::pin(cache::get_or_populate_in_memory_redis(
+                &db,
+                &format!(
+                    "{}_{}",
+                    merchant_id.clone().get_string_repr(),
+                    profile_id.get_string_repr()
+                ),
+                find_call(),
+                cache::CacheId::Accounts,
+            ))
+            .await
+            .unwrap();
 
         let delete_call = || async { db.delete_merchant_connector_account_by_id(&id).await };
 
@@ -473,7 +482,9 @@ mod merchant_connector_account_cache_tests {
         .await
         .unwrap();
 
-        assert!(ACCOUNTS_CACHE
+        assert!(db
+            .caches()
+            .accounts
             .get_val::<domain::MerchantConnectorAccount>(CacheKey {
                 key: format!("{}_{}", merchant_id.get_string_repr(), connector_label),
                 prefix: String::default(),

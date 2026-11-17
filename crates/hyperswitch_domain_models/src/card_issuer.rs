@@ -1,6 +1,7 @@
 use common_utils::{errors, id_type};
 use diesel_models::card_issuer;
 
+#[router_derive::track_async_interface]
 #[async_trait::async_trait]
 pub trait CardIssuersInterface {
     type Error;
@@ -22,9 +23,8 @@ pub trait CardIssuersInterface {
 
     async fn list_card_issuers(
         &self,
-        query: Option<String>,
-        limit: Option<u8>,
-    ) -> errors::CustomResult<Vec<card_issuer::CardIssuer>, Self::Error>;
+        limit: i64,
+    ) -> errors::CustomResult<Vec<card_issuer::CardIssuerListItem>, Self::Error>;
 
     async fn get_card_issuers_by_ids(
         &self,

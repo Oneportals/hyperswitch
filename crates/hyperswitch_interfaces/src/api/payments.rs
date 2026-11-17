@@ -7,8 +7,10 @@ use hyperswitch_domain_models::{
             CompleteAuthorize, CompleteRefundSurchrge, CompleteSurcharge, CreateConnectorCustomer,
             ExtendAuthorization, GenerateQr, IncrementalAuthorization, PSync, PaymentMethodToken,
             PostCaptureVoid, PostCaptureVoidSync, PostProcessing, PostSessionTokens,
-            PreAuthorizeVoid, PreProcessing, PushNotification, Reject, SdkSessionUpdate, Session,
-            SettlementSplitCreate, SetupMandate, UpdateMetadata, Void,
+            PreAuthorizeVoid, PushNotification, Reject, SdkSessionUpdate, Session,
+            SettlementSplitCreate, SetupMandate,
+            SurchargeRefundComplete as SurchargeRefundCompleteFlow,
+            SurchargeRefundInit as SurchargeRefundInitFlow, UpdateMetadata, Void,
         },
         Authenticate, CreateOrder, ExternalVaultProxy, GiftCardBalanceCheck, PostAuthenticate,
         PreAuthenticate, UpdatePostConfirm,
@@ -22,15 +24,16 @@ use hyperswitch_domain_models::{
         PaymentsCompleteRefundSurchrgeData, PaymentsCompleteSurchargeData,
         PaymentsExtendAuthorizationData, PaymentsIncrementalAuthorizationData,
         PaymentsPostAuthenticateData, PaymentsPostProcessingData, PaymentsPostSessionTokensData,
-        PaymentsPreAuthenticateData, PaymentsPreAuthorizeCancelData, PaymentsPreProcessingData,
-        PaymentsRejectData, PaymentsSessionData, PaymentsSurchargeCalculationData,
-        PaymentsSyncData, PaymentsTaxCalculationData, PaymentsUpdateMetadataData,
-        PaymentsUpdatePostConfirmData, PushNotificationRequestData, SdkPaymentsSessionUpdateData,
-        SettlementSplitRequestData, SetupMandateRequestData,
+        PaymentsPreAuthenticateData, PaymentsPreAuthorizeCancelData, PaymentsRejectData,
+        PaymentsSessionData, PaymentsSurchargeCalculationData, PaymentsSurchargeRefundCompleteData,
+        PaymentsSurchargeRefundInitData, PaymentsSyncData, PaymentsTaxCalculationData,
+        PaymentsUpdateMetadataData, PaymentsUpdatePostConfirmData, PushNotificationRequestData,
+        SdkPaymentsSessionUpdateData, SettlementSplitRequestData, SetupMandateRequestData,
     },
     router_response_types::{
         CompleteRefundSurchrgeResponseData, CompleteSurchargeResponseData,
         GiftCardBalanceCheckResponseData, PaymentsResponseData, SurchargeCalculationResponseData,
+        SurchargeRefundCompleteResponseData, SurchargeRefundInitResponseData,
         TaxCalculationResponseData,
     },
 };
@@ -204,6 +207,26 @@ pub trait SurchargeComplete:
 {
 }
 
+/// Initializes an external surcharge refund and returns its fee and new refund ID.
+pub trait SurchargeRefundInit:
+    api::ConnectorIntegration<
+    SurchargeRefundInitFlow,
+    PaymentsSurchargeRefundInitData,
+    SurchargeRefundInitResponseData,
+>
+{
+}
+
+/// Completes an external surcharge refund after the processor refund succeeds.
+pub trait SurchargeRefundComplete:
+    api::ConnectorIntegration<
+    SurchargeRefundCompleteFlow,
+    PaymentsSurchargeRefundCompleteData,
+    SurchargeRefundCompleteResponseData,
+>
+{
+}
+
 /// trait SurchargeRefund
 pub trait SurchargeRefund:
     api::ConnectorIntegration<
@@ -247,12 +270,6 @@ pub trait PaymentsCompleteAuthorize:
 /// trait ConnectorCustomer
 pub trait ConnectorCustomer:
     api::ConnectorIntegration<CreateConnectorCustomer, ConnectorCustomerData, PaymentsResponseData>
-{
-}
-
-/// trait PaymentsPreProcessing
-pub trait PaymentsPreProcessing:
-    api::ConnectorIntegration<PreProcessing, PaymentsPreProcessingData, PaymentsResponseData>
 {
 }
 

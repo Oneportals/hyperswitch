@@ -138,6 +138,7 @@ pub fn construct_uas_router_data<F: Clone, Req, Res>(
         payment_method_status: None,
         connector_response: None,
         integrity_check: Ok(()),
+        accept_amount_mismatch: None,
         additional_merchant_data: None,
         header_payload: None,
         connector_mandate_request_reference_id: None,
@@ -529,7 +530,7 @@ pub async fn get_auth_multi_token_from_external_vault<F, Req>(
                 let external_vault_mca_id = external_vault_details.vault_connector_id.clone();
 
                 let merchant_connector_account_details = state
-                    .store
+                    .accounts_store
                     .find_by_merchant_connector_account_merchant_id_merchant_connector_id(
                         platform.get_processor().get_account().get_id(),
                         &external_vault_mca_id,
@@ -709,6 +710,7 @@ pub fn construct_uas_webhook_router_data<F: Clone, Req, Res>(
         payment_method_status: None,
         connector_response: None,
         integrity_check: Ok(()),
+        accept_amount_mismatch: None,
         additional_merchant_data: None,
         header_payload: None,
         connector_mandate_request_reference_id: None,

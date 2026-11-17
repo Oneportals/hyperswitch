@@ -24,7 +24,6 @@ pub async fn upsert_conditional_config(
     use common_utils::ext_traits::OptionExt;
 
     let key_manager_state: &KeyManagerState = &(&state).into();
-    let db = &*state.store;
     let name = request.name;
     let program = request.program;
     let timestamp = common_utils::date_time::now_unix_timestamp();
@@ -44,7 +43,8 @@ pub async fn upsert_conditional_config(
     let business_profile_update = domain::ProfileUpdate::DecisionManagerRecordUpdate {
         three_ds_decision_manager_config: decision_manager_record,
     };
-    let updated_profile = db
+    let updated_profile = state
+        .accounts_store
         .update_profile_by_profile_id(&key_store, profile, business_profile_update)
         .await
         .change_context(errors::ApiErrorResponse::InternalServerError)
@@ -116,7 +116,7 @@ pub async fn upsert_conditional_config(
         .get_account()
         .get_id()
         .get_payment_config_routing_id();
-    let read_config_key = db.find_config_by_key(&key).await;
+    let read_config_key = db.find_config_by_key_optional(&key).await;
 
     euclid::frontend::ast::lowering::lower_program(prog.clone())
         .change_context(errors::ApiErrorResponse::InvalidRequestData {
@@ -125,7 +125,7 @@ pub async fn upsert_conditional_config(
         .attach_printable("The Request has an Invalid Comparison")?;
 
     match read_config_key {
-        Ok(config) => {
+        Ok(Some(config)) => {
             let previous_record: DecisionManagerRecord = config
                 .config
                 .parse_struct("DecisionManagerRecord")
@@ -167,7 +167,7 @@ pub async fn upsert_conditional_config(
 
             Ok(service_api::ApplicationResponse::Json(new_algo))
         }
-        Err(e) if e.current_context().is_db_not_found() => {
+        Ok(None) => {
             let new_rec = DecisionManagerRecord {
                 name: name
                     .get_required_value("name")
@@ -271,9 +271,11 @@ pub async fn retrieve_conditional_config(
         .get_id()
         .get_payment_config_routing_id();
     let algo_config = db
-        .find_config_by_key(&algorithm_id)
+        .find_config_by_key_optional(&algorithm_id)
         .await
         .change_context(errors::ApiErrorResponse::ResourceIdNotFound)
+        .attach_printable("Error fetching the conditional config from the DB")?
+        .ok_or(errors::ApiErrorResponse::ResourceIdNotFound)
         .attach_printable("The conditional config was not found in the DB")?;
     let record: DecisionManagerRecord = algo_config
         .config

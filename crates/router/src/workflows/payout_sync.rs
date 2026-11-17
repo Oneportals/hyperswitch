@@ -12,7 +12,10 @@ use scheduler::{
 };
 
 use crate::{
-    core::{configs::dimension_state, payouts, webhooks},
+    core::{
+        configs::dimension_state, payouts, payouts::validator::PayoutExecutionKindValidation,
+        webhooks,
+    },
     errors as core_errors,
     routes::SessionState,
     types::{api, domain, storage},
@@ -50,14 +53,14 @@ impl ProcessTrackerWorkflow<SessionState> for PayoutSyncWorkFlow {
             .merchant_id
             .clone()
             .get_required_value("merchant_id")?;
-        let key_store = db
-            .get_merchant_key_store_by_merchant_id(
-                &merchant_id,
-                &db.get_master_key().to_vec().into(),
-            )
+        let key_store_master_key = db.get_master_key().to_vec().into();
+        let key_store = state
+            .accounts_store
+            .get_merchant_key_store_by_merchant_id(&merchant_id, &key_store_master_key)
             .await?;
 
-        let merchant_account = db
+        let merchant_account = state
+            .accounts_store
             .find_merchant_account_by_merchant_id(&merchant_id, &key_store)
             .await?;
 
@@ -77,6 +80,7 @@ impl ProcessTrackerWorkflow<SessionState> for PayoutSyncWorkFlow {
             None,
             &request,
             DEFAULT_LOCALE,
+            false,
         ))
         .await?;
 
@@ -148,6 +152,10 @@ impl PayoutSyncWorkFlow {
         application_source: common_enums::ApplicationSource,
         dimensions: &dimension_state::DimensionsWithProcessorAndProviderMerchantIdAndConnector,
     ) -> common_utils::errors::CustomResult<(), core_errors::ApiErrorResponse> {
+        payout_data
+            .payout_attempt
+            .execution_kind
+            .validate_normal_execution_kind()?;
         let db = &*state.store;
         let scheduled_time = Self::get_payout_sync_process_schedule_time(
             state,
@@ -254,7 +262,6 @@ impl PayoutSyncWorkFlow {
         platform: &domain::Platform,
         process: storage::ProcessTracker,
     ) -> Result<(), errors::ProcessTrackerError> {
-        let db = &*state.store;
         state
             .store
             .as_scheduler()
@@ -263,7 +270,8 @@ impl PayoutSyncWorkFlow {
 
         let event_type: Option<enums::EventType> = payout_data.payout_attempt.status.into();
 
-        let business_profile = db
+        let business_profile = state
+            .accounts_store
             .find_business_profile_by_profile_id(key_store, &payout_data.profile_id)
             .await
             .map_err(errors::ProcessTrackerError::EStorageError)?;

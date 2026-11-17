@@ -9,7 +9,7 @@ use hyperswitch_domain_models::{
     payment_method_data::{Card, PaymentMethodData},
     payments::{payment_attempt::PaymentAttempt, PaymentIntent, PaymentStatusData},
 };
-use hyperswitch_masking::PeekInterface;
+use hyperswitch_masking::{PeekInterface, Secret};
 use router_env::logger;
 use serde::{Deserialize, Serialize};
 
@@ -17,6 +17,29 @@ use crate::{
     core::revenue_recovery::schedule::StaticLadderProgress, db::StorageInterface,
     routes::SessionState, types, workflows::revenue_recovery,
 };
+/// What the recovery request workflow needs to process one transaction the merchant reported.
+/// Process tracker data is stored and logged in clear, so the request is kept encrypted with the
+/// merchant's key, and only identifiers are kept in clear, for debugging.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+pub struct RecoveryRequestTrackingData {
+    /// Id of the recovery request, which the id of its process tracker job is built from: one for
+    /// each transaction of an invoice in a profile.
+    pub recovery_request_id: String,
+    pub merchant_id: id_type::MerchantId,
+    pub profile_id: id_type::ProfileId,
+    pub merchant_reference_id: id_type::PaymentReferenceId,
+    pub connector_transaction_id: String,
+    pub connector: common_types::payments::RecoveryConnector,
+    /// When the API accepted the recovery request.
+    #[serde(with = "common_utils::custom_serde::iso8601")]
+    pub received_at: time::PrimitiveDateTime,
+    /// Version of the stored request's format, which a run checks before reading the request.
+    pub request_version: u8,
+    /// The request exactly as the merchant sent it, encrypted with the merchant's key and base64
+    /// encoded.
+    pub encrypted_request: String,
+}
+
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
 pub struct RevenueRecoveryWorkflowTrackingData {
     pub merchant_id: id_type::MerchantId,
@@ -29,11 +52,17 @@ pub struct RevenueRecoveryWorkflowTrackingData {
     /// Standardised error code for the failed attempt that motivated this retry chain,
     #[serde(default)]
     pub prev_attempt_error_code: Option<enums::StandardisedCode>,
-    /// Adaptive retry scheduling state — how far down the static ladder this invoice has
-    /// been. Only meaningful on the CALCULATE row, which is reopened rather than recreated
-    /// and so survives for the whole recovery lifecycle of an invoice.
+    /// Ladder position carried across an invoice's recovery. Inert since the static ladder was
+    /// removed from the decision — nothing advances it and nothing reads it to pick a time — but
+    /// still seeded and still persisted, so it keeps round-tripping until it is removed properly.
+    /// Only meaningful on the CALCULATE row, which is reopened rather than recreated and so
+    /// survives for the whole recovery lifecycle of an invoice.
     #[serde(default)]
     pub static_ladder_progress: Option<StaticLadderProgress>,
+    /// The card calculate picked for the retry, which execute pays with. Only set on the EXECUTE
+    /// row, and missing on rows queued before calculate recorded its pick.
+    #[serde(default)]
+    pub payment_processor_token: Option<Secret<String>>,
 }
 
 #[derive(Debug, Clone)]
@@ -45,12 +74,29 @@ pub struct RevenueRecoveryPaymentData {
     pub retry_algorithm: enums::RevenueRecoveryAlgorithmType,
     pub psync_data: Option<PaymentStatusData<types::api::PSync>>,
 }
+
+/// The merchant and profile an invoice belongs to.
+#[derive(Clone, Copy)]
+pub struct RecoveryMerchantContext<'a> {
+    pub merchant_account: &'a merchant_account::MerchantAccount,
+    pub key_store: &'a merchant_key_store::MerchantKeyStore,
+    pub profile: &'a business_profile::Profile,
+}
+
 impl RevenueRecoveryPaymentData {
+    pub fn get_merchant_context(&self) -> RecoveryMerchantContext<'_> {
+        RecoveryMerchantContext {
+            merchant_account: &self.merchant_account,
+            key_store: &self.key_store,
+            profile: &self.profile,
+        }
+    }
+
     pub async fn get_schedule_time_based_on_retry_type(
         &self,
         state: &SessionState,
         merchant_id: &id_type::MerchantId,
-        retry_count: i32,
+        retry_count: u32,
         payment_attempt: &PaymentAttempt,
         payment_intent: &PaymentIntent,
         is_hard_decline: bool,
@@ -96,19 +142,26 @@ impl RevenueRecoveryPaymentData {
 
 #[derive(Debug, serde::Deserialize, Clone, Default)]
 pub struct RevenueRecoverySettings {
-    pub monitoring_threshold_in_seconds: i64,
     pub retry_algorithm_type: enums::RevenueRecoveryAlgorithmType,
     pub recovery_timestamp: RecoveryTimestamp,
     pub card_config: RetryLimitsConfig,
     pub redis_ttl_in_seconds: i64,
     #[serde(default)]
     pub retry_stats_lock: RetryStatsLockSettings,
-    /// Fallback hour-of-day (UTC, 0–23) the MathModel schedules a retry at when a cluster has no
+    /// Fallback hour-of-day (UTC, 0–23) the retry model schedules at when a cluster has no
     /// usable hour-of-day history. Overridable per environment via the config file's
     /// `[revenue_recovery]` section or the `ROUTER__REVENUE_RECOVERY__DEFAULT_RETRY_HOUR_UTC` env var;
     /// when omitted it defaults to noon UTC (see [`DefaultRetryHour`]).
     #[serde(default)]
     pub default_retry_hour_utc: DefaultRetryHour,
+    /// Minimum probability the systematic-k sampler gives every candidate day, so no day is ruled
+    /// out on a model that has never tried it. `ROUTER__REVENUE_RECOVERY__EXPLORATION_FLOOR`.
+    #[serde(default)]
+    pub exploration_floor: ExplorationFloor,
+    /// Distance within which two day values count as tied and split their share of the budget
+    /// equally. `ROUTER__REVENUE_RECOVERY__TIE_TOLERANCE`. See [`TieTolerance`] before raising it.
+    #[serde(default)]
+    pub tie_tolerance: TieTolerance,
 }
 
 /// Redis distributed-lock settings for revenue-recovery retry-stats recording
@@ -139,7 +192,7 @@ impl RetryStatsLockSettings {
     }
 }
 
-/// Fallback hour-of-day (UTC, 0–23) for the MathModel. A newtype so its `Default` (noon UTC = 12) is
+/// Fallback hour-of-day (UTC, 0–23) for the retry model. A newtype so its `Default` (noon UTC = 12) is
 /// carried automatically by both `#[derive(Default)]` on the settings and serde's `#[serde(default)]`
 /// — the value lives in exactly one place, with no field-list repetition.
 #[derive(Debug, Clone, Copy, serde::Deserialize)]
@@ -148,6 +201,87 @@ pub struct DefaultRetryHour(pub u8);
 impl Default for DefaultRetryHour {
     fn default() -> Self {
         Self(12)
+    }
+}
+
+impl DefaultRetryHour {
+    /// The hour to schedule at: the configured one when it names a real hour, the default
+    /// otherwise. Out of range it would degrade to midnight downstream, which is a legal-looking
+    /// time nobody would question — so it warns instead of being quietly clamped.
+    pub fn resolve(self) -> u8 {
+        if self.0 <= 23 {
+            return self.0;
+        }
+        let fallback = Self::default().0;
+        logger::warn!(
+            configured = self.0,
+            fallback,
+            "revenue_recovery.default_retry_hour_utc is outside 0-23; using the default"
+        );
+        fallback
+    }
+}
+
+/// Exploration floor for the systematic-k sampler: the minimum inclusion probability every
+/// candidate day is guaranteed. A business dial — higher explores more and uses the model less.
+/// Values above `budget / window_length` are infeasible and get clamped at the point of use.
+#[derive(Debug, Clone, Copy, serde::Deserialize)]
+pub struct ExplorationFloor(pub f64);
+
+impl Default for ExplorationFloor {
+    fn default() -> Self {
+        Self(0.10)
+    }
+}
+
+impl ExplorationFloor {
+    /// The floor to sample with: the configured one when it is a probability, the default
+    /// otherwise. Outside `[0, 1)` it is not one, and the sampler clamps it at the point of use —
+    /// so without this the misconfiguration would never surface anywhere.
+    pub fn resolve(self) -> f64 {
+        if (0.0..1.0).contains(&self.0) {
+            return self.0;
+        }
+        let fallback = Self::default().0;
+        logger::warn!(
+            configured = self.0,
+            fallback,
+            "revenue_recovery.exploration_floor is not in [0, 1); using the default"
+        );
+        fallback
+    }
+}
+
+/// Distance within which two candidate-day values are treated as tied.
+///
+/// Raising this is not safe by inspection. A merge only changes anything where the group spans the
+/// rank the budget ran out at, and there it averages a near-certain day with a floored one — a
+/// swing of up to `1 − exploration_floor`. On production stats the smallest gap at that rank was
+/// 4.2e-05, so above that this starts reallocating probability between days the model ranks apart.
+#[derive(Debug, Clone, Copy, serde::Deserialize)]
+pub struct TieTolerance(pub f64);
+
+impl Default for TieTolerance {
+    fn default() -> Self {
+        Self(1e-4)
+    }
+}
+
+impl TieTolerance {
+    /// The tolerance to group by: the configured one when it is a usable distance, the default
+    /// otherwise. Negative merges nothing and non-finite merges everything, since every `<=`
+    /// against `NaN` is false and every one against infinity is true.
+    pub fn resolve(self) -> f64 {
+        if self.0 >= 0.0 && self.0.is_finite() {
+            return self.0;
+        }
+        let fallback = Self::default().0;
+        logger::warn!(
+            configured = self.0,
+            fallback,
+            "revenue_recovery.tie_tolerance is negative or not finite; using the default"
+        );
+        fallback
     }
 }
 
@@ -195,6 +329,43 @@ impl RetryLimitsConfig {
             self.0.get(&net).unwrap_or(&DEFAULT_CONFIG)
         } else {
             self.0.get(&CardNetwork::Visa).unwrap_or(&DEFAULT_CONFIG)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tunable_tests {
+    use super::*;
+
+    #[test]
+    fn a_usable_value_is_returned_as_configured() {
+        assert_eq!(DefaultRetryHour(0).resolve(), 0);
+        assert_eq!(DefaultRetryHour(23).resolve(), 23);
+        assert!((ExplorationFloor(0.0).resolve() - 0.0).abs() < f64::EPSILON);
+        assert!((ExplorationFloor(0.25).resolve() - 0.25).abs() < f64::EPSILON);
+        assert!((TieTolerance(0.0).resolve() - 0.0).abs() < f64::EPSILON);
+        assert!((TieTolerance(1e-3).resolve() - 1e-3).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn an_unusable_value_falls_back_to_the_default() {
+        // Each guard's far side, including the boundary that is deliberately excluded: a floor of
+        // exactly 1.0 means "always", which is not a floor.
+        assert_eq!(
+            DefaultRetryHour(24).resolve(),
+            DefaultRetryHour::default().0
+        );
+        for floor in [1.0, -0.1, f64::NAN, f64::INFINITY] {
+            assert!(
+                (ExplorationFloor(floor).resolve() - ExplorationFloor::default().0).abs()
+                    < f64::EPSILON
+            );
+        }
+        for tolerance in [-1e-9, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(
+                (TieTolerance(tolerance).resolve() - TieTolerance::default().0).abs()
+                    < f64::EPSILON
+            );
         }
     }
 }

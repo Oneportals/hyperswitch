@@ -13,6 +13,11 @@ pub static PREDEFINED_ROLES: LazyLock<HashMap<&'static str, RoleInfo>> = LazyLoc
         common_utils::consts::ROLE_ID_INTERNAL_ADMIN,
         RoleInfo {
             groups: vec![
+                PermissionGroup::ReconApiKeyView,
+                PermissionGroup::ReconApiKeyManage,
+                PermissionGroup::ReconAccountsView,
+                PermissionGroup::ReconAccountsManage,
+                PermissionGroup::ReconAuditView,
                 PermissionGroup::OperationsView,
                 PermissionGroup::OperationsManage,
                 PermissionGroup::ConnectorsView,
@@ -32,6 +37,10 @@ pub static PREDEFINED_ROLES: LazyLock<HashMap<&'static str, RoleInfo>> = LazyLoc
                 PermissionGroup::ReconTransactionsManage,
                 PermissionGroup::ReconRulesView,
                 PermissionGroup::ReconRulesManage,
+                PermissionGroup::AlertsView,
+                PermissionGroup::AlertsManage,
+                PermissionGroup::MonitoringView,
+                PermissionGroup::MonitoringManage,
             ],
             role_id: common_utils::consts::ROLE_ID_INTERNAL_ADMIN.to_string(),
             role_name: "internal_admin".to_string(),
@@ -48,6 +57,9 @@ pub static PREDEFINED_ROLES: LazyLock<HashMap<&'static str, RoleInfo>> = LazyLoc
         common_utils::consts::ROLE_ID_INTERNAL_VIEW_ONLY_USER,
         RoleInfo {
             groups: vec![
+                PermissionGroup::ReconApiKeyView,
+                PermissionGroup::ReconAccountsView,
+                PermissionGroup::ReconAuditView,
                 PermissionGroup::OperationsView,
                 PermissionGroup::ConnectorsView,
                 PermissionGroup::WorkflowsView,
@@ -58,9 +70,44 @@ pub static PREDEFINED_ROLES: LazyLock<HashMap<&'static str, RoleInfo>> = LazyLoc
                 PermissionGroup::ReconExceptionsView,
                 PermissionGroup::ReconTransactionsView,
                 PermissionGroup::ReconRulesView,
+                PermissionGroup::AlertsView,
+                PermissionGroup::MonitoringView,
             ],
             role_id: common_utils::consts::ROLE_ID_INTERNAL_VIEW_ONLY_USER.to_string(),
             role_name: "internal_view_only".to_string(),
+            scope: RoleScope::Organization,
+            entity_type: EntityType::Merchant,
+            is_invitable: false,
+            is_deletable: false,
+            is_updatable: false,
+            is_internal: true,
+            product_type_filter: None,
+        },
+    );
+    roles.insert(
+        common_utils::consts::ROLE_ID_INTERNAL_OPERATOR,
+        RoleInfo {
+            groups: vec![
+                PermissionGroup::ReconApiKeyView,
+                PermissionGroup::ReconAccountsView,
+                PermissionGroup::ReconAuditView,
+                PermissionGroup::OperationsView,
+                PermissionGroup::ConnectorsView,
+                PermissionGroup::WorkflowsView,
+                PermissionGroup::AnalyticsView,
+                PermissionGroup::UsersView,
+                PermissionGroup::AccountView,
+                PermissionGroup::ReconSourcesView,
+                PermissionGroup::ReconExceptionsView,
+                PermissionGroup::ReconTransactionsView,
+                PermissionGroup::ReconRulesView,
+                PermissionGroup::AlertsView,
+                PermissionGroup::AlertsManage,
+                PermissionGroup::MonitoringView,
+                PermissionGroup::MonitoringManage,
+            ],
+            role_id: common_utils::consts::ROLE_ID_INTERNAL_OPERATOR.to_string(),
+            role_name: "internal_operator".to_string(),
             scope: RoleScope::Organization,
             entity_type: EntityType::Merchant,
             is_invitable: false,
@@ -75,6 +122,11 @@ pub static PREDEFINED_ROLES: LazyLock<HashMap<&'static str, RoleInfo>> = LazyLoc
         common_utils::consts::ROLE_ID_TENANT_ADMIN,
         RoleInfo {
             groups: vec![
+                PermissionGroup::ReconApiKeyView,
+                PermissionGroup::ReconApiKeyManage,
+                PermissionGroup::ReconAccountsView,
+                PermissionGroup::ReconAccountsManage,
+                PermissionGroup::ReconAuditView,
                 PermissionGroup::OperationsView,
                 PermissionGroup::OperationsManage,
                 PermissionGroup::ConnectorsView,
@@ -88,6 +140,7 @@ pub static PREDEFINED_ROLES: LazyLock<HashMap<&'static str, RoleInfo>> = LazyLoc
                 PermissionGroup::AccountManage,
                 PermissionGroup::ReconSourcesView,
                 PermissionGroup::ReconSourcesManage,
+                PermissionGroup::CloneConnectorManage,
                 PermissionGroup::ReconExceptionsView,
                 PermissionGroup::ReconExceptionsManage,
                 PermissionGroup::ReconTransactionsView,
@@ -112,6 +165,11 @@ pub static PREDEFINED_ROLES: LazyLock<HashMap<&'static str, RoleInfo>> = LazyLoc
         common_utils::consts::ROLE_ID_ORGANIZATION_ADMIN,
         RoleInfo {
             groups: vec![
+                PermissionGroup::ReconApiKeyView,
+                PermissionGroup::ReconApiKeyManage,
+                PermissionGroup::ReconAccountsView,
+                PermissionGroup::ReconAccountsManage,
+                PermissionGroup::ReconAuditView,
                 PermissionGroup::OperationsView,
                 PermissionGroup::OperationsManage,
                 PermissionGroup::ConnectorsView,
@@ -439,6 +497,9 @@ pub static PREDEFINED_ROLES: LazyLock<HashMap<&'static str, RoleInfo>> = LazyLoc
         consts::user_role::ROLE_ID_RECON_MERCHANT_ADMIN,
         RoleInfo {
             groups: vec![
+                PermissionGroup::ReconAccountsView,
+                PermissionGroup::ReconAccountsManage,
+                PermissionGroup::ReconAuditView,
                 PermissionGroup::ReconSourcesView,
                 PermissionGroup::ReconSourcesManage,
                 PermissionGroup::ReconExceptionsView,
@@ -449,6 +510,8 @@ pub static PREDEFINED_ROLES: LazyLock<HashMap<&'static str, RoleInfo>> = LazyLoc
                 PermissionGroup::UsersManage,
                 PermissionGroup::ReconRulesView,
                 PermissionGroup::ReconRulesManage,
+                PermissionGroup::ReconApiKeyView,
+                PermissionGroup::ReconApiKeyManage,
             ],
             role_id: consts::user_role::ROLE_ID_RECON_MERCHANT_ADMIN.to_string(),
             role_name: "recon_merchant_admin".to_string(),
@@ -465,6 +528,10 @@ pub static PREDEFINED_ROLES: LazyLock<HashMap<&'static str, RoleInfo>> = LazyLoc
         consts::user_role::ROLE_ID_RECON_MERCHANT_DATA_ENGINEER,
         RoleInfo {
             groups: vec![
+                PermissionGroup::ReconApiKeyView,
+                PermissionGroup::ReconAccountsView,
+                PermissionGroup::ReconAccountsManage,
+                PermissionGroup::ReconAuditView,
                 PermissionGroup::ReconSourcesView,
                 PermissionGroup::ReconSourcesManage,
                 PermissionGroup::ReconTransactionsView,
@@ -486,6 +553,8 @@ pub static PREDEFINED_ROLES: LazyLock<HashMap<&'static str, RoleInfo>> = LazyLoc
         consts::user_role::ROLE_ID_RECON_MERCHANT_OPERATOR,
         RoleInfo {
             groups: vec![
+                PermissionGroup::ReconAccountsView,
+                PermissionGroup::ReconAuditView,
                 PermissionGroup::ReconExceptionsView,
                 PermissionGroup::ReconExceptionsManage,
                 PermissionGroup::ReconTransactionsView,
@@ -509,11 +578,14 @@ pub static PREDEFINED_ROLES: LazyLock<HashMap<&'static str, RoleInfo>> = LazyLoc
         consts::user_role::ROLE_ID_RECON_MERCHANT_VIEW_ONLY,
         RoleInfo {
             groups: vec![
+                PermissionGroup::ReconAccountsView,
+                PermissionGroup::ReconAuditView,
                 PermissionGroup::ReconSourcesView,
                 PermissionGroup::ReconTransactionsView,
                 PermissionGroup::ReconExceptionsView,
                 PermissionGroup::UsersView,
                 PermissionGroup::ReconRulesView,
+                PermissionGroup::ReconApiKeyView,
             ],
             role_id: consts::user_role::ROLE_ID_RECON_MERCHANT_VIEW_ONLY.to_string(),
             role_name: "recon_merchant_view_only".to_string(),
@@ -532,6 +604,9 @@ pub static PREDEFINED_ROLES: LazyLock<HashMap<&'static str, RoleInfo>> = LazyLoc
         consts::user_role::ROLE_ID_RECON_PROFILE_ADMIN,
         RoleInfo {
             groups: vec![
+                PermissionGroup::ReconAccountsView,
+                PermissionGroup::ReconAccountsManage,
+                PermissionGroup::ReconAuditView,
                 PermissionGroup::ReconSourcesView,
                 PermissionGroup::ReconSourcesManage,
                 PermissionGroup::ReconExceptionsView,
@@ -558,6 +633,9 @@ pub static PREDEFINED_ROLES: LazyLock<HashMap<&'static str, RoleInfo>> = LazyLoc
         consts::user_role::ROLE_ID_RECON_PROFILE_DATA_ENGINEER,
         RoleInfo {
             groups: vec![
+                PermissionGroup::ReconAccountsView,
+                PermissionGroup::ReconAccountsManage,
+                PermissionGroup::ReconAuditView,
                 PermissionGroup::ReconSourcesView,
                 PermissionGroup::ReconSourcesManage,
                 PermissionGroup::ReconTransactionsView,
@@ -579,6 +657,8 @@ pub static PREDEFINED_ROLES: LazyLock<HashMap<&'static str, RoleInfo>> = LazyLoc
         consts::user_role::ROLE_ID_RECON_PROFILE_OPERATOR,
         RoleInfo {
             groups: vec![
+                PermissionGroup::ReconAccountsView,
+                PermissionGroup::ReconAuditView,
                 PermissionGroup::ReconExceptionsView,
                 PermissionGroup::ReconExceptionsManage,
                 PermissionGroup::ReconTransactionsView,
@@ -602,6 +682,8 @@ pub static PREDEFINED_ROLES: LazyLock<HashMap<&'static str, RoleInfo>> = LazyLoc
         consts::user_role::ROLE_ID_RECON_PROFILE_VIEW_ONLY,
         RoleInfo {
             groups: vec![
+                PermissionGroup::ReconAccountsView,
+                PermissionGroup::ReconAuditView,
                 PermissionGroup::ReconSourcesView,
                 PermissionGroup::ReconTransactionsView,
                 PermissionGroup::ReconExceptionsView,

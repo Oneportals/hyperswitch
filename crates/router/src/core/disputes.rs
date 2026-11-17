@@ -5,11 +5,10 @@ use api_models::{
 };
 use common_utils::ext_traits::{Encode, ValueExt};
 use error_stack::ResultExt;
-use router_env::{
-    instrument, logger,
-    tracing::{self, Instrument},
-};
+use router_env::{instrument, logger, tracing::Instrument};
 use strum::IntoEnumIterator;
+#[cfg(feature = "v1")]
+pub mod gateway;
 pub mod transformers;
 
 use common_enums;
@@ -20,7 +19,7 @@ use super::{
     metrics,
 };
 use crate::{
-    core::{files, payments, utils as core_utils, webhooks},
+    core::{files, payments, unified_connector_service, utils as core_utils, webhooks},
     routes::{app::StorageInterface, metrics::TASKS_ADDED_COUNT, SessionState},
     services,
     types::{
@@ -74,9 +73,9 @@ pub async fn retrieve_dispute(
     let payment_intent = db
         .find_payment_intent_by_payment_id_processor_merchant_id(
             &dispute.payment_id,
-            platform.get_processor().get_account().get_id(),
+            &platform.get_processor().get_processor_merchant_id(),
             platform.get_processor().get_key_store(),
-            platform.get_processor().get_account().storage_scheme,
+            platform.get_processor().get_storage_scheme(),
         )
         .await
         .change_context(errors::ApiErrorResponse::PaymentNotFound)?;
@@ -89,9 +88,9 @@ pub async fn retrieve_dispute(
             let payment_attempt = db
                 .find_payment_attempt_by_payment_id_processor_merchant_id_attempt_id(
                     &dispute.payment_id,
-                    platform.get_processor().get_account().get_id(),
+                    &platform.get_processor().get_processor_merchant_id(),
                     &dispute.attempt_id,
-                    platform.get_processor().get_account().storage_scheme,
+                    platform.get_processor().get_storage_scheme(),
                     platform.get_processor().get_key_store(),
                 )
                 .await
@@ -140,7 +139,7 @@ pub async fn retrieve_dispute(
             })?;
 
             let business_profile = state
-                .store
+                .accounts_store
                 .find_business_profile_by_profile_id(
                     platform.get_processor().get_key_store(),
                     &payment_attempt.profile_id,
@@ -210,9 +209,9 @@ pub async fn retrieve_disputes_list(
             .store
             .find_payment_intent_by_payment_id_processor_merchant_id(
                 &dispute_response.payment_id,
-                processor.get_account().get_id(),
+                &processor.get_processor_merchant_id(),
                 processor.get_key_store(),
-                processor.get_account().storage_scheme,
+                processor.get_storage_scheme(),
             )
             .await
             .change_context(errors::ApiErrorResponse::PaymentNotFound)?;
@@ -291,6 +290,137 @@ pub async fn get_filters_for_disputes(
 
 #[cfg(feature = "v1")]
 #[instrument(skip(state))]
+pub async fn retrieve_disputes_list_for_platform(
+    state: SessionState,
+    platform: domain::Platform,
+    profile_id_list: Option<Vec<common_utils::id_type::ProfileId>>,
+    constraints: api_models::disputes::PlatformDisputeListConstraints,
+) -> RouterResponse<api_models::disputes::PlatformDisputeListResponse> {
+    common_utils::fp_utils::when(
+        !platform.get_provider().get_account().is_platform_account(),
+        || {
+            Err(error_stack::report!(errors::ApiErrorResponse::Unauthorized))
+                .attach_printable("Platform disputes list is only accessible to platform merchants")
+        },
+    )?;
+
+    let platform_merchant_id = platform.get_provider().get_account().get_id();
+    let db = state.store.as_ref();
+
+    let dispute_list_constraints = &(constraints, profile_id_list).try_into()?;
+
+    let disputes = db
+        .find_disputes_by_constraints_for_platform(platform_merchant_id, dispute_list_constraints)
+        .await
+        .to_not_found_response(errors::ApiErrorResponse::InternalServerError)
+        .attach_printable("Unable to retrieve platform disputes")?;
+
+    let total_count = db
+        .get_disputes_count_for_platform(platform_merchant_id, dispute_list_constraints)
+        .await
+        .to_not_found_response(errors::ApiErrorResponse::InternalServerError)
+        .attach_printable("Unable to count platform disputes")?;
+
+    let data: Vec<api_models::disputes::PlatformDisputeListItem> = disputes
+        .into_iter()
+        .map(api_models::disputes::PlatformDisputeListItem::foreign_from)
+        .collect();
+
+    Ok(services::ApplicationResponse::Json(
+        api_models::disputes::PlatformDisputeListResponse {
+            count: data.len(),
+            total_count,
+            data,
+        },
+    ))
+}
+
+#[cfg(feature = "v1")]
+#[instrument(skip(state))]
+pub async fn get_platform_disputes_filters(
+    state: SessionState,
+    platform: domain::Platform,
+    profile_id_list: Option<Vec<common_utils::id_type::ProfileId>>,
+) -> RouterResponse<api_models::disputes::PlatformDisputeListFilters> {
+    common_utils::fp_utils::when(
+        !platform.get_provider().get_account().is_platform_account(),
+        || {
+            Err(error_stack::report!(errors::ApiErrorResponse::Unauthorized)).attach_printable(
+                "Platform dispute filters are only accessible to platform merchants",
+            )
+        },
+    )?;
+
+    let db = state.store.as_ref();
+
+    let merchant_accounts = state
+        .accounts_store
+        .list_merchant_accounts_by_organization_id(
+            platform.get_provider().get_account().get_org_id(),
+        )
+        .await
+        .to_not_found_response(errors::ApiErrorResponse::MerchantAccountNotFound)?;
+
+    let mut connector_map: HashMap<String, Vec<MerchantConnectorInfo>> = HashMap::new();
+
+    for connected_account in merchant_accounts.into_iter().filter(|account| {
+        account.merchant_account_type == common_enums::MerchantAccountType::Connected
+    }) {
+        let merchant_id = connected_account.get_id().clone();
+        let key_store_master_key = db.get_master_key().to_vec().into();
+        let key_store = state
+            .accounts_store
+            .get_merchant_key_store_by_merchant_id(&merchant_id, &key_store_master_key)
+            .await
+            .to_not_found_response(errors::ApiErrorResponse::MerchantAccountNotFound)?;
+
+        let processor = domain::Platform::new(
+            connected_account.clone(),
+            key_store.clone(),
+            connected_account,
+            key_store,
+            None,
+        )
+        .get_processor()
+        .clone();
+
+        let merchant_connector_accounts = if let services::ApplicationResponse::Json(data) =
+            super::admin::list_payment_connectors(state.clone(), processor, profile_id_list.clone())
+                .await?
+        {
+            data
+        } else {
+            return Err(errors::ApiErrorResponse::InternalServerError.into());
+        };
+
+        merchant_connector_accounts
+            .into_iter()
+            .filter_map(|merchant_connector_account| {
+                merchant_connector_account
+                    .connector_label
+                    .clone()
+                    .map(|label| {
+                        let info = merchant_connector_account.to_merchant_connector_info(&label);
+                        (merchant_connector_account.connector_name, info)
+                    })
+            })
+            .for_each(|(connector_name, info)| {
+                connector_map.entry(connector_name).or_default().push(info);
+            });
+    }
+
+    Ok(services::ApplicationResponse::Json(
+        api_models::disputes::PlatformDisputeListFilters {
+            connector: connector_map,
+            currency: storage_enums::Currency::iter().collect(),
+            dispute_status: storage_enums::DisputeStatus::iter().collect(),
+            dispute_stage: storage_enums::DisputeStage::iter().collect(),
+        },
+    ))
+}
+
+#[cfg(feature = "v1")]
+#[instrument(skip(state))]
 pub async fn accept_dispute(
     state: SessionState,
     processor: domain::Processor,
@@ -330,9 +460,9 @@ pub async fn accept_dispute(
     let payment_intent = db
         .find_payment_intent_by_payment_id_processor_merchant_id(
             &dispute.payment_id,
-            processor.get_account().get_id(),
+            &processor.get_processor_merchant_id(),
             processor.get_key_store(),
-            processor.get_account().storage_scheme,
+            processor.get_storage_scheme(),
         )
         .await
         .change_context(errors::ApiErrorResponse::PaymentNotFound)?;
@@ -340,9 +470,9 @@ pub async fn accept_dispute(
     let payment_attempt = db
         .find_payment_attempt_by_payment_id_processor_merchant_id_attempt_id(
             &dispute.payment_id,
-            processor.get_account().get_id(),
+            &processor.get_processor_merchant_id(),
             &dispute.attempt_id,
-            processor.get_account().storage_scheme,
+            processor.get_storage_scheme(),
             processor.get_key_store(),
         )
         .await
@@ -358,25 +488,43 @@ pub async fn accept_dispute(
         AcceptDisputeRequestData,
         AcceptDisputeResponse,
     > = connector_data.connector.get_connector_integration();
-    let router_data = core_utils::construct_accept_dispute_router_data(
+    let (router_data, merchant_connector_account) =
+        core_utils::construct_accept_dispute_router_data(
+            &state,
+            &payment_intent,
+            &payment_attempt,
+            &processor,
+            &dispute,
+        )
+        .await?;
+    let (execution_path, updated_state, rollout_result) =
+        unified_connector_service::should_call_unified_connector_service(
+            &state,
+            &processor,
+            &router_data,
+            None,
+            payments::CallConnectorAction::Trigger,
+            None,
+            common_enums::TransactionType::Payment,
+        )
+        .await?;
+    let response = gateway::execute_dispute_gateway(
         &state,
-        &payment_intent,
-        &payment_attempt,
+        &updated_state,
         &processor,
-        &dispute,
-    )
-    .await?;
-    let response = services::execute_connector_processing_step(
-        &state,
+        router_data,
         connector_integration,
-        &router_data,
-        payments::CallConnectorAction::Trigger,
-        None,
-        None,
+        gateway::DisputeGatewayContext {
+            execution_path,
+            rollout_result,
+            merchant_connector_account,
+            connector_transaction_id: payment_attempt
+                .get_connector_payment_id()
+                .map(ToString::to_string),
+        },
     )
     .await
-    .to_dispute_failed_response()
-    .attach_printable("Failed while calling accept dispute connector api")?;
+    .attach_printable("Failed while executing accept dispute gateway")?;
     let accept_dispute_response =
         response
             .response
@@ -460,9 +608,9 @@ pub async fn submit_evidence(
     let payment_intent = db
         .find_payment_intent_by_payment_id_processor_merchant_id(
             &dispute.payment_id,
-            processor.get_account().get_id(),
+            &processor.get_processor_merchant_id(),
             processor.get_key_store(),
-            processor.get_account().storage_scheme,
+            processor.get_storage_scheme(),
         )
         .await
         .change_context(errors::ApiErrorResponse::PaymentNotFound)?;
@@ -470,9 +618,9 @@ pub async fn submit_evidence(
     let payment_attempt = db
         .find_payment_attempt_by_payment_id_processor_merchant_id_attempt_id(
             &dispute.payment_id,
-            processor.get_account().get_id(),
+            &processor.get_processor_merchant_id(),
             &dispute.attempt_id,
-            processor.get_account().storage_scheme,
+            processor.get_storage_scheme(),
             processor.get_key_store(),
         )
         .await
@@ -489,26 +637,45 @@ pub async fn submit_evidence(
         SubmitEvidenceRequestData,
         SubmitEvidenceResponse,
     > = connector_data.connector.get_connector_integration();
-    let router_data = core_utils::construct_submit_evidence_router_data(
+    let (router_data, merchant_connector_account) =
+        core_utils::construct_submit_evidence_router_data(
+            &state,
+            &payment_intent,
+            &payment_attempt,
+            &processor,
+            &dispute,
+            submit_evidence_request_data,
+        )
+        .await?;
+    let connector_transaction_id = payment_attempt
+        .get_connector_payment_id()
+        .map(ToString::to_string);
+    let (execution_path, updated_state, rollout_result) =
+        unified_connector_service::should_call_unified_connector_service(
+            &state,
+            &processor,
+            &router_data,
+            None,
+            payments::CallConnectorAction::Trigger,
+            None,
+            common_enums::TransactionType::Payment,
+        )
+        .await?;
+    let response = Box::pin(gateway::execute_dispute_gateway(
         &state,
-        &payment_intent,
-        &payment_attempt,
+        &updated_state,
         &processor,
-        &dispute,
-        submit_evidence_request_data,
-    )
-    .await?;
-    let response = services::execute_connector_processing_step(
-        &state,
+        router_data,
         connector_integration,
-        &router_data,
-        payments::CallConnectorAction::Trigger,
-        None,
-        None,
-    )
+        gateway::DisputeGatewayContext {
+            execution_path,
+            rollout_result: rollout_result.clone(),
+            merchant_connector_account: merchant_connector_account.clone(),
+            connector_transaction_id: connector_transaction_id.clone(),
+        },
+    ))
     .await
-    .to_dispute_failed_response()
-    .attach_printable("Failed while calling submit evidence connector api")?;
+    .attach_printable("Failed while executing submit evidence gateway")?;
     let submit_evidence_response =
         response
             .response
@@ -537,17 +704,23 @@ pub async fn submit_evidence(
             &dispute,
         )
         .await?;
-        let defend_response = services::execute_connector_processing_step(
+        // Submit evidence and defend form one connector operation for Adyen.
+        // Keep both calls on the same execution path.
+        let defend_response = Box::pin(gateway::execute_dispute_gateway(
             &state,
+            &updated_state,
+            &processor,
+            defend_dispute_router_data,
             connector_integration_defend_dispute,
-            &defend_dispute_router_data,
-            payments::CallConnectorAction::Trigger,
-            None,
-            None,
-        )
+            gateway::DisputeGatewayContext {
+                execution_path,
+                rollout_result,
+                merchant_connector_account,
+                connector_transaction_id,
+            },
+        ))
         .await
-        .to_dispute_failed_response()
-        .attach_printable("Failed while calling defend dispute connector api")?;
+        .attach_printable("Failed while executing defend dispute gateway")?;
         let defend_dispute_response = defend_response.response.map_err(|err| {
             errors::ApiErrorResponse::ExternalConnectorError {
                 code: err.code,
@@ -624,7 +797,7 @@ pub async fn attach_evidence(
             })
         },
     )?;
-    let storage_scheme = platform.get_processor().get_account().storage_scheme;
+    let storage_scheme = platform.get_processor().get_storage_scheme();
     let create_file_response = Box::pin(files::files_create_core(
         state.clone(),
         platform,
@@ -654,7 +827,7 @@ pub async fn attach_evidence(
             .attach_printable("Error while encoding dispute evidence")?
             .into(),
     };
-    db.update_dispute(dispute, update_dispute, storage_scheme)
+    db.update_dispute(dispute, update_dispute, storage_scheme.inner())
         .await
         .to_not_found_response(errors::ApiErrorResponse::DisputeNotFound {
             dispute_id: dispute_id.to_owned(),
@@ -698,6 +871,7 @@ pub async fn retrieve_dispute_evidence(
 pub async fn delete_evidence(
     state: SessionState,
     processor: domain::Processor,
+    profile_id: Option<common_utils::id_type::ProfileId>,
     delete_evidence_request: dispute_models::DeleteEvidenceRequest,
 ) -> RouterResponse<serde_json::Value> {
     let dispute_id = delete_evidence_request.dispute_id.clone();
@@ -712,6 +886,7 @@ pub async fn delete_evidence(
         .to_not_found_response(errors::ApiErrorResponse::DisputeNotFound {
             dispute_id: dispute_id.clone(),
         })?;
+    core_utils::validate_profile_id_from_auth_layer(profile_id, &dispute)?;
     let dispute_evidence: api::DisputeEvidence = dispute
         .evidence
         .clone()
@@ -782,6 +957,7 @@ pub async fn get_aggregates_for_disputes(
 pub async fn connector_sync_disputes(
     state: SessionState,
     platform: domain::Platform,
+    profile_id: Option<common_utils::id_type::ProfileId>,
     merchant_connector_id: String,
     payload: disputes::DisputeFetchQueryData,
 ) -> RouterResponse<FetchDisputesResponse> {
@@ -809,6 +985,7 @@ pub async fn connector_sync_disputes(
     Box::pin(fetch_disputes_from_connector(
         state,
         platform,
+        profile_id,
         connector_id,
         fetch_dispute_request,
     ))
@@ -820,11 +997,13 @@ pub async fn connector_sync_disputes(
 pub async fn fetch_disputes_from_connector(
     state: SessionState,
     platform: domain::Platform,
+    profile_id: Option<common_utils::id_type::ProfileId>,
     merchant_connector_id: common_utils::id_type::MerchantConnectorAccountId,
     req: FetchDisputesRequestData,
 ) -> RouterResponse<FetchDisputesResponse> {
     let db = &*state.store;
-    let merchant_connector_account = db
+    let merchant_connector_account = state
+        .accounts_store
         .find_by_merchant_connector_account_merchant_id_merchant_connector_id(
             platform.get_processor().get_account().get_id(),
             &merchant_connector_id,
@@ -834,6 +1013,7 @@ pub async fn fetch_disputes_from_connector(
         .to_not_found_response(errors::ApiErrorResponse::MerchantConnectorAccountNotFound {
             id: merchant_connector_id.get_string_repr().to_string(),
         })?;
+    core_utils::validate_profile_id_from_auth_layer(profile_id, &merchant_connector_account)?;
     let connector_name = merchant_connector_account.connector_name.clone();
     let connector_data = api::ConnectorData::get_connector_by_name(
         &state.conf.connectors,
@@ -1111,18 +1291,16 @@ pub async fn schedule_dispute_sync_task(
 
         let processor_merchant_id = mca.merchant_id.clone();
 
+        let key_store_master_key = state.store.get_master_key().to_vec().into();
         let processor_key_store = state
-            .store
-            .get_merchant_key_store_by_merchant_id(
-                &processor_merchant_id,
-                &state.store.get_master_key().to_vec().into(),
-            )
+            .accounts_store
+            .get_merchant_key_store_by_merchant_id(&processor_merchant_id, &key_store_master_key)
             .await
             .to_not_found_response(errors::ApiErrorResponse::MerchantAccountNotFound)
             .attach_printable("Error while fetching the key store for processor merchant")?;
 
         let processor_account = state
-            .store
+            .accounts_store
             .find_merchant_account_by_merchant_id(&processor_merchant_id, &processor_key_store)
             .await
             .to_not_found_response(errors::ApiErrorResponse::MerchantAccountNotFound)

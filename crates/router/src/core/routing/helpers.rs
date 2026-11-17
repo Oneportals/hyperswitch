@@ -28,7 +28,7 @@ use external_services::grpc_client::dynamic_routing::{
 use hyperswitch_domain_models::api::ApplicationResponse;
 #[cfg(all(feature = "v1", feature = "dynamic_routing"))]
 use hyperswitch_interfaces::events::routing_api_logs as routing_events;
-use router_env::{instrument, logger, tracing};
+use router_env::{instrument, logger};
 use rustc_hash::FxHashSet;
 use storage_impl::redis::cache;
 #[cfg(all(feature = "dynamic_routing", feature = "v1"))]
@@ -47,7 +47,7 @@ use crate::{
         errors::{self, RouterResult},
         payments::routing::utils::{self as routing_utils, DecisionEngineApiHandler},
     },
-    db::StorageInterface,
+    db::{AccountsStorageInterface, StorageInterface},
     routes::SessionState,
     services,
     types::{domain, storage},
@@ -84,16 +84,16 @@ pub async fn get_merchant_default_config(
     transaction_type: &storage::enums::TransactionType,
 ) -> RouterResult<Vec<routing_types::RoutableConnectorChoice>> {
     let key = get_default_config_key(merchant_id, transaction_type);
-    let maybe_config = db.find_config_by_key(&key).await;
+    let config_optional = db.find_config_by_key_optional(&key).await;
 
-    match maybe_config {
-        Ok(config) => config
+    match config_optional {
+        Ok(Some(config)) => config
             .config
             .parse_struct("Vec<RoutableConnectors>")
             .change_context(errors::ApiErrorResponse::InternalServerError)
             .attach_printable("Merchant default config has invalid structure"),
 
-        Err(e) if e.current_context().is_db_not_found() => {
+        Ok(None) => {
             let new_config_conns = Vec::<routing_types::RoutableConnectorChoice>::new();
             let serialized = new_config_conns
                 .encode_to_string_of_json()
@@ -210,16 +210,18 @@ pub async fn update_merchant_active_algorithm_ref(
     };
 
     let db = &*state.store;
-    db.update_specific_fields_in_merchant(
-        &key_store.merchant_id,
-        merchant_account_update,
-        key_store,
-    )
-    .await
-    .change_context(errors::ApiErrorResponse::InternalServerError)
-    .attach_printable("Failed to update routing algorithm ref in merchant account")?;
+    state
+        .accounts_store
+        .update_specific_fields_in_merchant(
+            &key_store.merchant_id,
+            merchant_account_update,
+            key_store,
+        )
+        .await
+        .change_context(errors::ApiErrorResponse::InternalServerError)
+        .attach_printable("Failed to update routing algorithm ref in merchant account")?;
 
-    cache::redact_from_redis_and_publish(db.get_cache_store().as_ref(), [config_key])
+    cache::redact_from_redis_and_publish(db, [config_key])
         .await
         .change_context(errors::ApiErrorResponse::InternalServerError)
         .attach_printable("Failed to invalidate the config cache")?;
@@ -229,12 +231,13 @@ pub async fn update_merchant_active_algorithm_ref(
 
 #[cfg(feature = "v1")]
 pub async fn update_profile_active_algorithm_ref(
-    db: &dyn StorageInterface,
+    state: &SessionState,
     merchant_key_store: &domain::MerchantKeyStore,
     current_business_profile: domain::Profile,
     algorithm_id: routing_types::RoutingAlgorithmRef,
     transaction_type: &storage::enums::TransactionType,
 ) -> RouterResult<()> {
+    let db = state.store.as_ref();
     let ref_val = algorithm_id
         .encode_to_value()
         .change_context(errors::ApiErrorResponse::InternalServerError)
@@ -258,14 +261,16 @@ pub async fn update_profile_active_algorithm_ref(
         three_ds_decision_rule_algorithm,
     };
 
-    db.update_profile_by_profile_id(
-        merchant_key_store,
-        current_business_profile,
-        business_profile_update,
-    )
-    .await
-    .change_context(errors::ApiErrorResponse::InternalServerError)
-    .attach_printable("Failed to update routing algorithm ref in business profile")?;
+    state
+        .accounts_store
+        .update_profile_by_profile_id(
+            merchant_key_store,
+            current_business_profile,
+            business_profile_update,
+        )
+        .await
+        .change_context(errors::ApiErrorResponse::InternalServerError)
+        .attach_printable("Failed to update routing algorithm ref in business profile")?;
 
     // Invalidate the routing cache for Payments and Payouts transaction types
     if !transaction_type.is_three_ds_authentication() {
@@ -278,7 +283,7 @@ pub async fn update_profile_active_algorithm_ref(
             .into(),
         );
 
-        cache::redact_from_redis_and_publish(db.get_cache_store().as_ref(), [routing_cache_key])
+        cache::redact_from_redis_and_publish(db, [routing_cache_key])
             .await
             .change_context(errors::ApiErrorResponse::InternalServerError)
             .attach_printable("Failed to invalidate routing cache")?;
@@ -288,7 +293,7 @@ pub async fn update_profile_active_algorithm_ref(
 
 #[cfg(feature = "v1")]
 pub async fn update_business_profile_active_dynamic_algorithm_ref(
-    db: &dyn StorageInterface,
+    db: &dyn AccountsStorageInterface,
     merchant_key_store: &domain::MerchantKeyStore,
     current_business_profile: domain::Profile,
     dynamic_routing_algorithm_ref: routing_types::DynamicRoutingAlgorithmRef,
@@ -472,18 +477,17 @@ impl RoutingAlgorithmHelpers<'_> {
 /// not an error), so it maps to `InternalServerError` rather than a 404.
 #[cfg(all(feature = "v1", feature = "dynamic_routing"))]
 pub async fn validate_contract_based_label_info(
-    db: &dyn StorageInterface,
+    state: &SessionState,
     merchant_id: &id_type::MerchantId,
     profile_id: &id_type::ProfileId,
     label_info: &[routing_types::LabelInformation],
 ) -> RouterResult<()> {
     // Fetching disabled MCAs too: a contract config may reference a temporarily disabled
     // MCA — validation checks connector existence and label, not activity.
-    let all_mcas = db
-        .list_merchant_connector_accounts_without_encrypted_including_disabled_by_merchant_id_profile_id(
-            merchant_id,
-            profile_id,
-        )
+    let all_mcas = state.accounts_store.list_merchant_connector_accounts_without_encrypted_including_disabled_by_merchant_id_profile_id(
+                merchant_id,
+                profile_id,
+            )
         .await
         .change_context(errors::ApiErrorResponse::InternalServerError)
         .attach_printable(
@@ -535,9 +539,7 @@ pub async fn validate_connectors_in_routing_config(
 ) -> RouterResult<()> {
     // Fetching disabled MCAs too: routing configs may reference MCAs that are
     // temporarily disabled — validation checks connector existence, not activity.
-    let all_mcas = state
-        .store
-        .list_merchant_connector_accounts_without_encrypted_including_disabled_by_merchant_id_profile_id(merchant_id, profile_id)
+    let all_mcas = state.accounts_store.list_merchant_connector_accounts_without_encrypted_including_disabled_by_merchant_id_profile_id(merchant_id, profile_id)
         .await
         .change_context(errors::ApiErrorResponse::MerchantConnectorAccountNotFound {
             id: merchant_id.get_string_repr().to_owned(),
@@ -662,13 +664,12 @@ pub trait DynamicRoutingCache {
         key: &str,
     ) -> Option<Arc<Self>>;
 
-    async fn refresh_dynamic_routing_cache<T, F, Fut>(
+    async fn refresh_dynamic_routing_cache<T, Fut>(
         state: &SessionState,
         key: &str,
-        func: F,
+        func: Fut,
     ) -> RouterResult<T>
     where
-        F: FnOnce() -> Fut + Send,
         T: Cacheable + serde::Serialize + serde::de::DeserializeOwned + Debug + Clone,
         Fut: futures::Future<Output = errors::CustomResult<T, errors::StorageError>> + Send;
 }
@@ -680,7 +681,10 @@ impl DynamicRoutingCache for routing_types::SuccessBasedRoutingConfig {
         state: &SessionState,
         key: &str,
     ) -> Option<Arc<Self>> {
-        cache::SUCCESS_BASED_DYNAMIC_ALGORITHM_CACHE
+        state
+            .store
+            .caches()
+            .success_based_dynamic_algorithm
             .get_val::<Arc<Self>>(cache::CacheKey {
                 key: key.to_string(),
                 prefix: state.tenant.redis_key_prefix.clone(),
@@ -688,21 +692,20 @@ impl DynamicRoutingCache for routing_types::SuccessBasedRoutingConfig {
             .await
     }
 
-    async fn refresh_dynamic_routing_cache<T, F, Fut>(
+    async fn refresh_dynamic_routing_cache<T, Fut>(
         state: &SessionState,
         key: &str,
-        func: F,
+        func: Fut,
     ) -> RouterResult<T>
     where
-        F: FnOnce() -> Fut + Send,
         T: Cacheable + serde::Serialize + serde::de::DeserializeOwned + Debug + Clone,
         Fut: futures::Future<Output = errors::CustomResult<T, errors::StorageError>> + Send,
     {
-        cache::get_or_populate_in_memory(
-            state.store.get_cache_store().as_ref(),
+        cache::get_or_populate_in_memory_redis(
+            &*state.store,
             key,
             func,
-            &cache::SUCCESS_BASED_DYNAMIC_ALGORITHM_CACHE,
+            cache::CacheId::SuccessBasedDynamicAlgorithm,
         )
         .await
         .change_context(errors::ApiErrorResponse::InternalServerError)
@@ -717,7 +720,10 @@ impl DynamicRoutingCache for routing_types::ContractBasedRoutingConfig {
         state: &SessionState,
         key: &str,
     ) -> Option<Arc<Self>> {
-        cache::CONTRACT_BASED_DYNAMIC_ALGORITHM_CACHE
+        state
+            .store
+            .caches()
+            .contract_based_dynamic_algorithm
             .get_val::<Arc<Self>>(cache::CacheKey {
                 key: key.to_string(),
                 prefix: state.tenant.redis_key_prefix.clone(),
@@ -725,21 +731,20 @@ impl DynamicRoutingCache for routing_types::ContractBasedRoutingConfig {
             .await
     }
 
-    async fn refresh_dynamic_routing_cache<T, F, Fut>(
+    async fn refresh_dynamic_routing_cache<T, Fut>(
         state: &SessionState,
         key: &str,
-        func: F,
+        func: Fut,
     ) -> RouterResult<T>
     where
-        F: FnOnce() -> Fut + Send,
         T: Cacheable + serde::Serialize + serde::de::DeserializeOwned + Debug + Clone,
         Fut: futures::Future<Output = errors::CustomResult<T, errors::StorageError>> + Send,
     {
-        cache::get_or_populate_in_memory(
-            state.store.get_cache_store().as_ref(),
+        cache::get_or_populate_in_memory_redis(
+            &*state.store,
             key,
             func,
-            &cache::CONTRACT_BASED_DYNAMIC_ALGORITHM_CACHE,
+            cache::CacheId::ContractBasedDynamicAlgorithm,
         )
         .await
         .change_context(errors::ApiErrorResponse::InternalServerError)
@@ -754,7 +759,10 @@ impl DynamicRoutingCache for routing_types::EliminationRoutingConfig {
         state: &SessionState,
         key: &str,
     ) -> Option<Arc<Self>> {
-        cache::ELIMINATION_BASED_DYNAMIC_ALGORITHM_CACHE
+        state
+            .store
+            .caches()
+            .elimination_based_dynamic_algorithm
             .get_val::<Arc<Self>>(cache::CacheKey {
                 key: key.to_string(),
                 prefix: state.tenant.redis_key_prefix.clone(),
@@ -762,21 +770,20 @@ impl DynamicRoutingCache for routing_types::EliminationRoutingConfig {
             .await
     }
 
-    async fn refresh_dynamic_routing_cache<T, F, Fut>(
+    async fn refresh_dynamic_routing_cache<T, Fut>(
         state: &SessionState,
         key: &str,
-        func: F,
+        func: Fut,
     ) -> RouterResult<T>
     where
-        F: FnOnce() -> Fut + Send,
         T: Cacheable + serde::Serialize + serde::de::DeserializeOwned + Debug + Clone,
         Fut: futures::Future<Output = errors::CustomResult<T, errors::StorageError>> + Send,
     {
-        cache::get_or_populate_in_memory(
-            state.store.get_cache_store().as_ref(),
+        cache::get_or_populate_in_memory_redis(
+            &*state.store,
             key,
             func,
-            &cache::ELIMINATION_BASED_DYNAMIC_ALGORITHM_CACHE,
+            cache::CacheId::EliminationBasedDynamicAlgorithm,
         )
         .await
         .change_context(errors::ApiErrorResponse::InternalServerError)
@@ -831,7 +838,7 @@ where
         };
 
         let dynamic_routing_config =
-            T::refresh_dynamic_routing_cache(state, key.as_str(), func).await?;
+            T::refresh_dynamic_routing_cache(state, key.as_str(), func()).await?;
 
         Ok(dynamic_routing_config)
     }
@@ -843,44 +850,37 @@ pub async fn update_gateway_score_helper_with_open_router(
     state: &SessionState,
     payment_attempt: &storage::PaymentAttempt,
     profile_id: &id_type::ProfileId,
-    dynamic_routing_algo_ref: routing_types::DynamicRoutingAlgorithmRef,
 ) -> RouterResult<()> {
-    let is_success_rate_routing_enabled =
-        dynamic_routing_algo_ref.is_success_rate_routing_enabled();
-    let is_elimination_enabled = dynamic_routing_algo_ref.is_elimination_enabled();
+    let payment_connector = payment_attempt.connector.clone().ok_or(
+        errors::ApiErrorResponse::GenericNotFoundError {
+            message: "unable to derive payment connector from payment attempt".to_string(),
+        },
+    )?;
 
-    if is_success_rate_routing_enabled || is_elimination_enabled {
-        let payment_connector = &payment_attempt.connector.clone().ok_or(
-            errors::ApiErrorResponse::GenericNotFoundError {
-                message: "unable to derive payment connector from payment attempt".to_string(),
-            },
-        )?;
+    let routable_connector = routing_types::RoutableConnectorChoice {
+        choice_kind: api_models::routing::RoutableChoiceKind::FullStruct,
+        connector: euclid::enums::RoutableConnectors::from_str(payment_connector.as_str())
+            .change_context(errors::ApiErrorResponse::InternalServerError)
+            .attach_printable("unable to infer routable_connector from connector")?,
+        merchant_connector_id: payment_attempt.merchant_connector_id.clone(),
+    };
 
-        let routable_connector = routing_types::RoutableConnectorChoice {
-            choice_kind: api_models::routing::RoutableChoiceKind::FullStruct,
-            connector: euclid::enums::RoutableConnectors::from_str(payment_connector.as_str())
-                .change_context(errors::ApiErrorResponse::InternalServerError)
-                .attach_printable("unable to infer routable_connector from connector")?,
-            merchant_connector_id: payment_attempt.merchant_connector_id.clone(),
-        };
-
-        logger::debug!(
-            "performing update-gateway-score for gateway with id {} in open_router for profile: {}",
-            routable_connector,
-            profile_id.get_string_repr()
-        );
-        routing::payments_routing::update_gateway_score_with_open_router(
-            state,
-            routable_connector.clone(),
-            profile_id,
-            &payment_attempt.merchant_id,
-            &payment_attempt.payment_id,
-            payment_attempt.status,
-        )
-        .await
-        .change_context(errors::ApiErrorResponse::InternalServerError)
-        .attach_printable("failed to update gateway score in open_router service")?;
-    }
+    logger::debug!(
+        "decision_engine: performing update-gateway-score for gateway with id {} in open_router for profile: {}",
+        routing::format_connector_for_logging(routable_connector.connector, routable_connector.merchant_connector_id.as_ref()),
+        profile_id.get_string_repr()
+    );
+    routing::payments_routing::update_gateway_score_with_open_router(
+        state,
+        routable_connector,
+        profile_id,
+        &payment_attempt.merchant_id,
+        &payment_attempt.payment_id,
+        payment_attempt.status,
+    )
+    .await
+    .change_context(errors::ApiErrorResponse::InternalServerError)
+    .attach_printable("failed to update gateway score in open_router service")?;
 
     Ok(())
 }
@@ -1507,8 +1507,10 @@ pub async fn push_metrics_with_update_window_for_contract_based_routing(
                 )?;
 
             logger::debug!(
-                "contract based routing: matched LabelInformation - {:?}",
-                final_label_info
+                connector = %routing::format_connector_for_logging(payment_connector, Some(&final_label_info.mca_id)),
+                target_count = final_label_info.target_count,
+                target_time = final_label_info.target_time,
+                "contract based routing: matched LabelInformation"
             );
 
             let request_label_info = routing_types::LabelInformation {
@@ -1994,7 +1996,7 @@ pub async fn disable_dynamic_routing_algorithm(
 
     // redact cache for dynamic routing config
     let _ = cache::redact_from_redis_and_publish(
-        state.store.get_cache_store().as_ref(),
+        &*state.store,
         cache_entries_to_redact,
     )
     .await
@@ -2009,7 +2011,7 @@ pub async fn disable_dynamic_routing_algorithm(
         .to_not_found_response(errors::ApiErrorResponse::ResourceIdNotFound)?;
     let response = record.foreign_into();
     update_business_profile_active_dynamic_algorithm_ref(
-        db,
+        state.accounts_store.as_ref(),
         &key_store,
         business_profile,
         dynamic_routing_algorithm,
@@ -2091,7 +2093,7 @@ where
 {
     //Check for payload
     if let Some(payload) = payload {
-        return create_specific_dynamic_routing_setup(
+        return Box::pin(create_specific_dynamic_routing_setup(
             state,
             platform,
             business_profile,
@@ -2099,19 +2101,19 @@ where
             dynamic_routing_algo_ref,
             dynamic_routing_type,
             payload,
-        )
+        ))
         .await;
     }
     // Algorithm wasn't created yet
     let Some(mut algo_type) = algo_type else {
-        return default_specific_dynamic_routing_setup(
+        return Box::pin(default_specific_dynamic_routing_setup(
             state,
             platform,
             business_profile,
             feature_to_enable,
             dynamic_routing_algo_ref,
             dynamic_routing_type,
-        )
+        ))
         .await;
     };
 
@@ -2121,14 +2123,14 @@ where
         .get_algorithm_id_with_timestamp()
         .algorithm_id
     else {
-        return default_specific_dynamic_routing_setup(
+        return Box::pin(default_specific_dynamic_routing_setup(
             state,
             platform,
             business_profile,
             feature_to_enable,
             dynamic_routing_algo_ref,
             dynamic_routing_type,
-        )
+        ))
         .await;
     };
     let db = state.store.as_ref();
@@ -2147,7 +2149,7 @@ where
     *algo_type_enabled_features = feature_to_enable;
     dynamic_routing_algo_ref.update_enabled_features(dynamic_routing_type, feature_to_enable);
     update_business_profile_active_dynamic_algorithm_ref(
-        db,
+        state.accounts_store.as_ref(),
         platform.get_processor().get_key_store(),
         business_profile,
         dynamic_routing_algo_ref.clone(),
@@ -2274,7 +2276,7 @@ pub async fn default_specific_dynamic_routing_setup(
         dynamic_routing_type,
     );
     update_business_profile_active_dynamic_algorithm_ref(
-        db,
+        state.accounts_store.as_ref(),
         platform.get_processor().get_key_store(),
         business_profile,
         dynamic_routing_algo_ref,
@@ -2402,7 +2404,7 @@ pub async fn create_specific_dynamic_routing_setup(
 
     dynamic_routing_algo_ref.update_feature(feature_to_enable, dynamic_routing_type);
     update_business_profile_active_dynamic_algorithm_ref(
-        db,
+        state.accounts_store.as_ref(),
         platform.get_processor().get_key_store(),
         business_profile,
         dynamic_routing_algo_ref,
@@ -2923,13 +2925,10 @@ pub async fn redact_cgraph_cache(
 
     let config_payouts_key = cache::CacheKind::CGraph(cgraph_payouts_key.clone().into());
     let config_payments_key = cache::CacheKind::CGraph(cgraph_payments_key.clone().into());
-    cache::redact_from_redis_and_publish(
-        state.store.get_cache_store().as_ref(),
-        [config_payouts_key, config_payments_key],
-    )
-    .await
-    .change_context(errors::ApiErrorResponse::InternalServerError)
-    .attach_printable("Failed to invalidate the cgraph cache")?;
+    cache::redact_from_redis_and_publish(&*state.store, [config_payouts_key, config_payments_key])
+        .await
+        .change_context(errors::ApiErrorResponse::InternalServerError)
+        .attach_printable("Failed to invalidate the cgraph cache")?;
 
     Ok(())
 }
@@ -2955,7 +2954,7 @@ pub async fn redact_routing_cache(
     // this key lives in ROUTING_CACHE. (Redis deletion is by key, so only other pods were affected.)
     let routing_payments_cache_key = cache::CacheKind::Routing(routing_payments_key.clone().into());
     cache::redact_from_redis_and_publish(
-        state.store.get_cache_store().as_ref(),
+        &*state.store,
         [routing_payouts_cache_key, routing_payments_cache_key],
     )
     .await

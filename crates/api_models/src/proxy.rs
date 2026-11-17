@@ -29,11 +29,13 @@ impl Headers {
 
 #[derive(Debug, ToSchema, Clone, Deserialize, Serialize)]
 pub struct ProxyRequest {
-    /// The request body that needs to be forwarded
+    /// The request body that needs to be forwarded: JSON, or an XML document as a string with
+    /// an XML Content-Type. Other Content-Types are rejected. GET and DELETE send no body.
     pub request_body: Value,
-    /// The destination URL where the request needs to be forwarded
-    #[schema(value_type = String, example = "https://api.example.com/endpoint")]
-    pub destination_url: url::Url,
+    /// The non-empty HTTP or HTTPS destination URL. Configured proxy bypass hosts are rejected.
+    /// IP literals must be publicly routable.
+    #[schema(value_type = String, min_length = 1, example = "https://api.example.com/endpoint")]
+    pub destination_url: common_utils::outbound_url::SafeOutboundUrl,
     /// The headers that need to be forwarded
     #[schema(value_type = Object, example = r#"{ "key1": "value-1", "key2": "value-2" }"#)]
     pub headers: Headers,
@@ -56,10 +58,10 @@ pub enum TokenType {
     PaymentMethodToken,
 }
 
-#[derive(Debug, ToSchema, Clone, Deserialize, Serialize)]
+#[derive(Debug, ToSchema, Clone, Serialize)]
 pub struct ProxyResponse {
     /// The response received from the destination
-    pub response: Value,
+    pub response: ProxyResponseBody,
     /// The status code of the response
     pub status_code: u16,
     /// The headers of the response
@@ -67,5 +69,40 @@ pub struct ProxyResponse {
     pub response_headers: Headers,
 }
 
+/// The destination's response body: JSON when it parses as JSON, otherwise its text, such
+/// as an XML document. Only UTF-8 text is supported. Both variants serialize to the bare
+/// value, so a JSON string and text look the same on the wire; this type is serialize-only.
+#[derive(Debug, ToSchema, Clone, Serialize)]
+#[serde(untagged)]
+pub enum ProxyResponseBody {
+    /// A JSON body
+    Json(Value),
+    /// Any other body, as UTF-8 text
+    Text(String),
+}
+
 impl common_utils::events::ApiEventMetric for ProxyRequest {}
 impl common_utils::events::ApiEventMetric for ProxyResponse {}
+
+#[cfg(test)]
+mod tests {
+    use super::ProxyRequest;
+
+    #[test]
+    fn proxy_destination_cannot_be_empty() {
+        let mut request = serde_json::json!({
+            "request_body": {},
+            "destination_url": "https://merchant.example.com/hook",
+            "headers": {},
+            "method": "GET",
+            "token": "pm_example",
+            "token_type": "payment_method_id"
+        });
+        assert!(serde_json::from_value::<ProxyRequest>(request.clone()).is_ok());
+        request
+            .as_object_mut()
+            .expect("proxy request")
+            .insert("destination_url".to_string(), serde_json::json!(""));
+        assert!(serde_json::from_value::<ProxyRequest>(request).is_err());
+    }
+}

@@ -51,9 +51,6 @@ pub struct CreateConnectorCustomer;
 pub struct SetupMandate;
 
 #[derive(Debug, Clone)]
-pub struct PreProcessing;
-
-#[derive(Debug, Clone)]
 pub struct PushNotification;
 
 #[derive(Debug, Clone)]
@@ -79,6 +76,14 @@ pub struct CompleteSurcharge;
 
 #[derive(Debug, Clone)]
 pub struct CompleteRefundSurchrge;
+
+/// Initialize a surcharge refund before submitting the processor refund.
+#[derive(Debug, Clone)]
+pub struct SurchargeRefundInit;
+
+/// Complete the initialized surcharge refund after processor success.
+#[derive(Debug, Clone)]
+pub struct SurchargeRefundComplete;
 
 #[derive(Debug, Clone)]
 pub struct SdkSessionUpdate;
