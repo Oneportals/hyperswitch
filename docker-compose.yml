@@ -59,6 +59,7 @@ services:
   migration_runner:
     image: docker.io/debian:trixie-slim
     pull_policy: always
+    restart: "no"
     command: >
       bash -c "
       apt-get update && apt-get install -y curl xz-utils &&
